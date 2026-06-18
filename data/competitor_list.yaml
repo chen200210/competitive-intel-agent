@@ -1,0 +1,40 @@
+# ============================================
+# 竞品列表配置 + 业务方向定义
+# ============================================
+
+# === 公司业务方向定义 ===
+business_focus:
+  genres:
+    - "塔防"
+    - "移动塔防"
+    - "传统TD塔防"
+    - "移动城堡like"
+  themes:
+    - "微恐"        # 轻度恐怖
+    - "冰河"        # 冰雪/冰川题材
+    - "火山爆发"     # 火山/熔岩题材
+  validated_mechanisms:
+    - "已被市场验证的塔防玩法"
+    - "已验证的商业化模型"
+
+# === 重点关注竞品（在榜单上监控的已上线游戏） ===
+# 按 DESIGN.md 7.3 节定义，从榜单中筛选与业务方向相关的游戏
+monitored_games: []
+
+# === 在研公司追踪（不在榜单上，但需要主动搜索） ===
+# 按 DESIGN.md 7.3 节定义
+in_development_tracking: []
+
+# === 显著性判定阈值 ===
+significance_thresholds:
+  rank_change_min: 3
+  always_trigger:
+    - "new_entry"
+    - "dropped_out"
+    - "rank <= 5"
+  # TD 品类加成：同品类变动自动加分
+  genre_boost:
+    - genre: "塔防"
+      boost: 2.0
+    - theme: ["微恐", "冰河", "火山爆发"]
+      boost: 1.5

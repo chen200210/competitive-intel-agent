@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Database
+data/intel.db
+data/chroma/
+data/.diandian_chrome_profile/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+data/raw/ 
+data/.diandian_charts.json 
+data/processed/ 
+article.json 
+data/.diandian_charts.json 
+data/processed/ 
+article.json 
