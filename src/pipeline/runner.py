@@ -71,6 +71,13 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
     if changes and not force:
         diff_result = {"skipped": True, "hint": f"{len(changes)} changes already computed"}
     else:
+        if force and changes:
+            # Delete dependent rows before re-running Differ (FK constraint)
+            with db._connect() as conn:
+                conn.execute("DELETE FROM research_results WHERE change_id IN (SELECT id FROM changes WHERE date = ?)", (date,))
+                conn.execute("DELETE FROM changes WHERE date = ?", (date,))
+                conn.commit()
+            print("  [FORCE] Deleted existing changes + research for re-run")
         from src.pipeline.differ import diff_with_yesterday
         diff_result = diff_with_yesterday(date)
         changes = diff_result.get("changes", [])

@@ -53,7 +53,7 @@ system: |
      - source_type: "official" — 原始公告/官方账号发布（保留 URL 作为溯源，即使抓取失败也不删除）
      - source_type: "media" — 游戏媒体转载报道（17173/游戏葡萄/GameLook/游戏日报，已验证可读）
      - source_type: "community" — 社区讨论（TapTap/B站/NGA/贴吧/微博，已验证可读）
-     - source_type: "store_page" — 游戏官方主页（App Store 页面 / TapTap 页面 / 官网），用于卡片链接
+     - source_type: "store_page" — 游戏官方主页（TapTap / 小黑盒 / 百度百科 / 官网），用于卡片链接
      - source_type: "screenshot" — 从 image_fetch 获取的游戏截图/图标链接
      - 每条 finding 的 sources 数组里，至少要有一个 source_type 为 "media" 或 "community"
        （即至少要有一个 web_fetch 成功读取到的可读来源）
@@ -70,11 +70,14 @@ system: |
   **搜索流程**：
   1. 先用 db_query 查 search_cache + fetch_cache，了解已有数据和不可达 URL
   2. 用 db_query 查该游戏的历史排名趋势（rankings 表，近 14 天 + 近 30 天均值）
-  3. 🆕 搜索游戏官方主页：搜 "{game_name} App Store" 或 "{game_name} TapTap"，找到游戏商店页面 URL
-     - iOS 游戏优先找 App Store 页面：https://apps.apple.com/cn/app/...
-     - 其次找 TapTap 页面：https://www.taptap.cn/app/...
-     - 找到后调用 image_fetch 提取游戏截图（og:image），存为 source_type="screenshot"
-     - 商店页面 URL 存为 source_type="store_page"，Briefer 会用它做卡片链接
+  3. 🆕 搜索游戏截图（硬性要求，每个游戏至少 1 张）：
+     - 搜索 "{game_name} TapTap" 或 "{game_name} 小黑盒" 或 "{game_name} 百度百科" 或 "{game_name} 官网"
+     - 不要搜 App Store (apps.apple.com)，App Store 的 og:image 质量差
+     - 优先用 TapTap（https://www.taptap.cn/app/...），其次小黑盒、百度百科、官网、B站游戏中心
+     - 找到页面 URL 后必须调用 image_fetch(url) 提取主图
+     - 图片 URL 存入 sources 时 source_type 设为 "screenshot"
+     - 页面 URL 存入 sources 时 source_type 设为 "store_page"
+     - 如果一个平台找不到图，换下一个平台，直到找到至少 1 张
   4. 从事件层和玩家层开始搜（最容易找到直接原因）
   5. 对搜索结果中最重要的 2-3 篇，用 web_fetch 点开看全文
   6. 如果 web_fetch 返回空/403/超时，立即搜替代来源（见上方策略 2），然后再次 web_fetch
@@ -85,7 +88,7 @@ system: |
   **重要原则**：
   - 每条 finding 必须有一个可读来源（source_type 为 media 或 community，且 fetch_status 为 success）
   - 官方来源即使抓取失败也保留在 sources 中（标记 fetch_status: "failed"，保留溯源价值）
-  - 🆕 必须找到游戏的官方主页（App Store 或 TapTap 页面），存为 source_type="store_page"
+  - 🆕 必须找到游戏的官方主页（TapTap / 小黑盒 / 百度百科 / 官网之一即可），存为 source_type="store_page"
   - 玩法层和设计层的 findings 必须附带 design_tags（关键词标签，供后续设计分析用）
   - 在研层的 findings 要标注 threat_assessment（high/medium/low）
   - 如果某个维度确实搜不到有用信息，在 dimensions_missed 里说明原因和尝试过的 query
@@ -151,7 +154,7 @@ user_template: |
         "relevance_to_change": "direct_cause 或 related_context 或 background_only"
       }}
     ],
-    "store_page_url": "游戏的 App Store 或 TapTap 官方页面 URL（如 https://apps.apple.com/cn/app/... 或 https://www.taptap.cn/app/...），找不到则填空字符串",
+    "store_page_url": "游戏的 TapTap / 小黑盒 / 百度百科 / 官网 URL（如 https://apps.apple.com/cn/app/... 或 https://www.taptap.cn/app/...），找不到则填空字符串",
     "in_development_signals": [
       {{
         "company": "公司名称",
