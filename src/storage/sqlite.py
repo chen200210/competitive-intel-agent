@@ -197,6 +197,85 @@ CREATE TABLE IF NOT EXISTS agent_audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_run_id ON agent_audit_log(run_id);
 CREATE INDEX IF NOT EXISTS idx_audit_agent_date ON agent_audit_log(agent_name, target_date);
 
+-- TapTap daily new games (scraped from TapTap 今日新游)
+CREATE TABLE IF NOT EXISTS taptap_new_games (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    bundle_id TEXT,
+    downloads TEXT,
+    rating REAL,
+    tags TEXT,                   -- JSON array of tag strings
+    genre TEXT,
+    description TEXT,
+    taptap_url TEXT,
+    track_relevant BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, game_name)
+);
+
+-- Steam-to-mobile port tracking
+CREATE TABLE IF NOT EXISTS steam_port_games (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    steam_url TEXT,
+    mobile_bundle_id TEXT,
+    gameplay_tags TEXT,          -- JSON array of gameplay tag strings
+    genre TEXT,
+    has_mobile_version BOOLEAN DEFAULT 0,
+    track_relevant BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, game_name)
+);
+
+-- Market news headlines (GamerSky / 17173 / etc.)
+CREATE TABLE IF NOT EXISTS market_news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    source TEXT NOT NULL,        -- '游侠资讯' | '17173' | '其他'
+    url TEXT,
+    category TEXT,               -- '头条' | '赛道' | '老游戏更新'
+    related_game TEXT,
+    track_relevant BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, url)
+);
+
+-- Diandian on-demand search result cache (triggered by user click)
+CREATE TABLE IF NOT EXISTS diandian_search_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_name TEXT NOT NULL,
+    bundle_id TEXT,
+    search_date TEXT NOT NULL,
+    result_json TEXT,            -- full search result JSON
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Unreleased / in-development game tracking
+CREATE TABLE IF NOT EXISTS unreleased_games (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    developer TEXT,
+    genre TEXT,
+    theme TEXT,
+    status TEXT,                 -- '已定档' | 'demo' | '在研' | '测试中' | '即将上线'
+    release_date TEXT,           -- estimated release date or quarter
+    taptap_url TEXT,
+    source TEXT,                 -- where this info came from
+    track_relevant BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, game_name)
+);
+CREATE INDEX IF NOT EXISTS idx_taptap_new_date ON taptap_new_games(date);
+CREATE INDEX IF NOT EXISTS idx_steam_port_date ON steam_port_games(date);
+CREATE INDEX IF NOT EXISTS idx_market_news_date ON market_news(date);
+CREATE INDEX IF NOT EXISTS idx_market_news_source ON market_news(source);
+CREATE INDEX IF NOT EXISTS idx_diandian_cache_game ON diandian_search_cache(game_name);
+CREATE INDEX IF NOT EXISTS idx_unreleased_date ON unreleased_games(date);
+
 -- run_id columns for traceability (added via migration if missing)
 -- daily_overviews, research_results, analysis_reports get run_id
 
@@ -693,6 +772,141 @@ class Database:
                 "SELECT * FROM agent_audit_log WHERE run_id = ? ORDER BY id",
                 (run_id,),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── TapTap New Games CRUD ─────────────────────────────────
+
+    def insert_taptap_games(self, records: list[dict[str, Any]]) -> int:
+        """Bulk insert TapTap new game records."""
+        sql = """
+            INSERT OR REPLACE INTO taptap_new_games
+                (date, game_name, bundle_id, downloads, rating, tags, genre, description, taptap_url, track_relevant)
+            VALUES (:date, :game_name, :bundle_id, :downloads, :rating, :tags, :genre, :description, :taptap_url, :track_relevant)
+        """
+        with self._connect() as conn:
+            conn.executemany(sql, records)
+        return len(records)
+
+    def get_taptap_games_by_date(self, date: str) -> list[dict[str, Any]]:
+        """Return TapTap new games for a given date."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM taptap_new_games WHERE date = ? ORDER BY id",
+                (date,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Steam Port Games CRUD ─────────────────────────────────
+
+    def insert_steam_ports(self, records: list[dict[str, Any]]) -> int:
+        """Bulk insert Steam port game records."""
+        sql = """
+            INSERT OR REPLACE INTO steam_port_games
+                (date, game_name, steam_url, mobile_bundle_id, gameplay_tags, genre, has_mobile_version, track_relevant)
+            VALUES (:date, :game_name, :steam_url, :mobile_bundle_id, :gameplay_tags, :genre, :has_mobile_version, :track_relevant)
+        """
+        with self._connect() as conn:
+            conn.executemany(sql, records)
+        return len(records)
+
+    def get_steam_ports_by_date(self, date: str) -> list[dict[str, Any]]:
+        """Return Steam port games for a given date."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM steam_port_games WHERE date = ? ORDER BY id",
+                (date,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Market News CRUD ──────────────────────────────────────
+
+    def insert_market_news(self, records: list[dict[str, Any]]) -> int:
+        """Bulk insert market news records."""
+        sql = """
+            INSERT OR REPLACE INTO market_news
+                (date, headline, source, url, category, related_game, track_relevant)
+            VALUES (:date, :headline, :source, :url, :category, :related_game, :track_relevant)
+        """
+        with self._connect() as conn:
+            conn.executemany(sql, records)
+        return len(records)
+
+    def get_market_news_by_date(
+        self, date: str, source: str | None = None, track_relevant: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return market news for a given date, optionally filtered."""
+        conditions = ["date = ?"]
+        params: list[Any] = [date]
+        if source:
+            conditions.append("source = ?")
+            params.append(source)
+        if track_relevant is not None:
+            conditions.append("track_relevant = ?")
+            params.append(1 if track_relevant else 0)
+        sql = f"SELECT * FROM market_news WHERE {' AND '.join(conditions)} ORDER BY id"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Diandian Search Cache CRUD ────────────────────────────
+
+    def cache_diandian_search(self, game_name: str, search_date: str,
+                              result_json: str, bundle_id: str = "") -> int:
+        """Cache a Diandian search result."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO diandian_search_cache
+                   (game_name, bundle_id, search_date, result_json)
+                   VALUES (?, ?, ?, ?)""",
+                (game_name, bundle_id, search_date, result_json),
+            )
+            return cur.lastrowid
+
+    def get_diandian_search_cache(
+        self, game_name: str, max_age_days: int = 7,
+    ) -> dict[str, Any] | None:
+        """Return cached Diandian search result if fresh enough."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM diandian_search_cache
+                   WHERE game_name = ?
+                     AND datetime(created_at) > datetime('now', ? || ' days')
+                   ORDER BY created_at DESC LIMIT 1""",
+                (game_name, f"-{max_age_days}"),
+            ).fetchone()
+        return dict(row) if row else None
+
+    # ── Unreleased Games CRUD ─────────────────────────────────
+
+    def upsert_unreleased_games(self, records: list[dict[str, Any]]) -> int:
+        """Bulk upsert unreleased game records."""
+        sql = """
+            INSERT OR REPLACE INTO unreleased_games
+                (date, game_name, developer, genre, theme, status, release_date, taptap_url, source, track_relevant)
+            VALUES (:date, :game_name, :developer, :genre, :theme, :status, :release_date, :taptap_url, :source, :track_relevant)
+        """
+        with self._connect() as conn:
+            conn.executemany(sql, records)
+        return len(records)
+
+    def get_unreleased_games_by_date(
+        self, date: str | None = None, track_relevant: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return unreleased games, optionally filtered."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if date:
+            conditions.append("date = ?")
+            params.append(date)
+        if track_relevant is not None:
+            conditions.append("track_relevant = ?")
+            params.append(1 if track_relevant else 0)
+        sql = "SELECT * FROM unreleased_games"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY date DESC, id"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     # ── Utility ─────────────────────────────────────────────

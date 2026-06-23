@@ -24,7 +24,7 @@ MONITORED_HIGH_PRIORITY: set[str] = set()
 # Genre/theme boost configuration (loaded from competitor_list.yaml at runtime)
 GENRE_BOOSTS: list[dict[str, Any]] = [
     {"genre": "塔防", "boost": 2.0},
-    {"theme": ["微恐", "冰河", "火山爆发"], "boost": 1.5},
+    {"genre": "肉鸽", "boost": 2.0},
 ]
 
 
@@ -36,6 +36,7 @@ def compute_attention_score(
     yesterday_rank: int | None,
     rank_change: int | None,
     bundle_id: str,
+    game_name: str = "",
 ) -> float:
     """
     Compute attention_score (0–10) for a single change.
@@ -46,6 +47,7 @@ def compute_attention_score(
       3. Magnitude of change (big jumps = high attention)
       4. Breakout bonus (jumping from low rank is a stronger signal)
       5. Priority watchlist bonus
+      6. Track relevance bonus (赛道游戏 +1.5)
     """
     score = 0.0
 
@@ -111,9 +113,18 @@ def compute_attention_score(
         if yr > 50 and delta >= 5:
             score += 1.0
 
-    # ── 4. Priority watchlist ──
+    # ── 5. Priority watchlist ──
     if bundle_id in MONITORED_HIGH_PRIORITY:
         score += 1.0
+
+    # ── 6. Track relevance bonus ──
+    if game_name:
+        try:
+            from src.pipeline.track_filter import classify_game
+            if classify_game(game_name) == "track":
+                score += 1.5
+        except Exception:
+            pass
 
     return min(score, 10.0)
 
@@ -224,7 +235,8 @@ def _diff_one_chart(
             continue  # no change record needed for stable
 
         attention_score = compute_attention_score(
-            change_type, today_rank, yesterday_rank, rank_change, bundle_id
+            change_type, today_rank, yesterday_rank, rank_change, bundle_id,
+            game_name=t.get("game_name", ""),
         )
 
         changes.append({
@@ -348,6 +360,8 @@ def diff_with_yesterday(date: str) -> dict[str, Any]:
     # 5. Persist to database
     if all_changes:
         db.insert_changes(all_changes)
+        # Re-read to get auto-increment IDs assigned by SQLite
+        all_changes = db.get_changes_by_date(date)
 
     return {
         "date": date,

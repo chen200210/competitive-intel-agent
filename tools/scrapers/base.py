@@ -182,14 +182,24 @@ class ChartScraper:
         """Write cleaned rows to a CSV file with standard naming."""
         date_str = datetime.now().strftime("%Y%m%d")
         # Sanitize platform and chart_type for filenames
-        platform_slug = self.platform.lower().replace(" ", "_")
+        platform_slug = self.platform.lower().replace(" ", "_").replace("/", "_")
         chart_slug = self.chart_type
 
         filename = f"{platform_slug}_{chart_slug}_{date_str}.csv"
         csv_path = self.output_dir / filename
 
+        # Collect all unique keys across all rows (not just first row)
+        # — fixes crash when EXTRA_COLUMNS are sparse (some rows have a field, some don't)
+        all_keys: list[str] = []
+        seen_keys: set[str] = set()
+        for row in rows:
+            for key in row:
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_keys.append(key)
+
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(f, fieldnames=all_keys, restval="")
             writer.writeheader()
             writer.writerows(rows)
 

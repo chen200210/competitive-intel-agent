@@ -189,7 +189,8 @@ def push_daily_card(
 ) -> dict[str, Any]:
     """Push the daily report card for a given date to a Feishu chat.
 
-    Reads the Briefer card JSON from the analysis_reports table.
+    Reads the Briefer card JSON from the analysis_reports table,
+    enriches it with interactive elements, and pushes to Feishu.
     If date is None, uses the latest available date.
     """
     from src.storage.sqlite import get_db
@@ -208,6 +209,16 @@ def push_daily_card(
     try:
         card_data = json.loads(report["brief_card_json"])
         card = card_data.get("card", card_data)
+
+        # 🆕 Enrich with diandian search action buttons
+        try:
+            taptap_games = db.get_taptap_games_by_date(date)
+            if taptap_games:
+                from src.feishu.card_builder import enrich_card_with_diandian_actions
+                card = enrich_card_with_diandian_actions(card, taptap_games)
+        except Exception:
+            pass  # enrichment is optional — don't block push
+
         return push_card(card, chat_id)
     except json.JSONDecodeError as e:
         return {"error": f"Failed to parse card JSON: {e}"}

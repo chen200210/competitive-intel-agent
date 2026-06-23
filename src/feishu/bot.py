@@ -54,6 +54,154 @@ def _classify_intent(text: str) -> dict[str, Any]:
         return {"intent": "casual_chat", "entities": {}}
 
 
+# ── Card action handler ───────────────────────────────────────────
+
+def _handle_card_action(event_obj: Any) -> None:
+    """Handle card.action.trigger events (button clicks on interactive cards)."""
+    try:
+        print(f"\n[CARD_ACTION] Received event: {type(event_obj).__name__}")
+
+        event = getattr(event_obj, 'event', None)
+        print(f"[CARD_ACTION] event type: {type(event).__name__ if event else 'None'}")
+        print(f"[CARD_ACTION] event dir: {[a for a in dir(event) if not a.startswith('_')]}")
+        action_attr = getattr(event, 'action', None)
+        action_value = getattr(action_attr, 'value', None) if action_attr else None
+        print(f"[CARD_ACTION] value: {repr(action_value)[:200]}")
+
+        if not action_value:
+            print("[CARD_ACTION] No action_value — skipping")
+            return
+
+        # action_value might be dict or JSON string
+        if isinstance(action_value, str):
+            try:
+                action_value = json.loads(action_value)
+            except Exception:
+                print(f"[CARD_ACTION] Failed to parse action_value JSON")
+                return
+
+        if isinstance(action_value, dict):
+            action = action_value.get("action", "")
+            game_name = action_value.get("game_name", "")
+        else:
+            print(f"[CARD_ACTION] Unexpected action_value type: {type(action_value)}")
+            return
+
+        print(f"[CARD_ACTION] action={action}, game_name={game_name}")
+
+        if action != "diandian_search" or not game_name:
+            return
+
+        # Extract chat_id from multiple possible locations
+        chat_id = ""
+        for attr_name in ['chat_id', 'open_chat_id', 'open_id', 'user_id']:
+            for obj in [event, getattr(event, 'context', None), getattr(event, 'host', None)]:
+                if obj:
+                    val = getattr(obj, attr_name, None)
+                    if val:
+                        print(f"[CARD_ACTION] Found {attr_name}={val} on {type(obj).__name__}")
+                        if not chat_id and attr_name in ('chat_id', 'open_chat_id'):
+                            chat_id = val
+
+        if not chat_id:
+            # Last resort: print all context fields
+            ctx = getattr(event, 'context', None)
+            if ctx:
+                print(f"[CARD_ACTION] context dir: {[a for a in dir(ctx) if not a.startswith('_')]}")
+            host = getattr(event, 'host', None)
+            if host:
+                print(f"[CARD_ACTION] host dir: {[a for a in dir(host) if not a.startswith('_')]}")
+            operator = getattr(event, 'operator', None)
+            if operator:
+                print(f"[CARD_ACTION] operator dir: {[a for a in dir(operator) if not a.startswith('_')]}")
+
+        print(f"[CARD_ACTION] chat_id final: {chat_id}")
+
+        if not chat_id:
+            return
+
+        print(f"🔍 Diandian search: '{game_name}' (chat: {chat_id[:12]}...)")
+
+        # Run search in background thread to avoid blocking the bot
+        import threading
+        thread = threading.Thread(
+            target=_do_diandian_search_and_reply,
+            args=(game_name, chat_id),
+            daemon=True,
+        )
+        thread.start()
+
+    except Exception as e:
+        logger.error(f"Card action processing error: {e}")
+
+
+def _do_diandian_search_and_reply(game_name: str, chat_id: str) -> None:
+    """Run diandian search in background and push result card to chat."""
+    from src.feishu.pusher import push_text, push_card
+
+    # Acknowledge immediately
+    push_text(f"🔍 正在点点数据搜索「{game_name}」...", chat_id)
+
+    try:
+        from tools.diandian_search import search_game_on_diandian
+        result = search_game_on_diandian(game_name)
+    except Exception as e:
+        push_text(f"❌ 点点数据搜索「{game_name}」出错：{e}", chat_id)
+        return
+
+    if not result.get("found"):
+        error_msg = result.get("error", "未找到该游戏")
+        push_text(f"❌ 点点数据「{game_name}」：{error_msg}", chat_id)
+        return
+
+    # Build result card
+    downloads = result.get("downloads") or {}
+    revenue = result.get("revenue") or {}
+    rating = result.get("rating")
+    developer = result.get("developer", "")
+    genre = result.get("genre", "")
+    bundle_id = result.get("bundle_id", "")
+    cached = result.get("cached", False)
+    source_url = result.get("source_url", "")
+
+    # Build markdown content
+    lines = [f"**🔍 点点数据：{game_name}**", ""]
+    if developer:
+        lines.append(f"开发商：{developer}")
+    if genre:
+        lines.append(f"品类：{genre}")
+    if bundle_id:
+        lines.append(f"Bundle ID：{bundle_id}")
+    lines.append("")
+    if downloads:
+        trend = downloads.get("trend", "")
+        trend_icon = {"上升": "📈", "下降": "📉", "稳定": "➡️"}.get(trend, "")
+        lines.append(f"下载量（近30天）：{trend_icon} {downloads.get('last_30d', 'N/A')}")
+    if revenue:
+        trend = revenue.get("trend", "")
+        trend_icon = {"上升": "📈", "下降": "📉", "稳定": "➡️"}.get(trend, "")
+        lines.append(f"收入（近30天）：{trend_icon} {revenue.get('last_30d', 'N/A')}")
+    if rating is not None:
+        lines.append(f"评分：{rating}")
+    if cached:
+        lines.append("")
+        lines.append("_(数据来自缓存)_")
+    if source_url:
+        lines.append(f"→ [点点数据]({source_url})")
+
+    card = {
+        "header": {
+            "title": {"tag": "plain_text", "content": f"🔍 {game_name}"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": "\\n".join(lines)},
+        ],
+    }
+
+    push_card(card, chat_id)
+
+
 # ── Reply ───────────────────────────────────────────────────────
 
 def _reply_text(text: str, chat_id: str) -> None:
@@ -249,7 +397,9 @@ def start_bot() -> None:
     handler = handler.builder(
         encrypt_key="",
         verification_token=settings.feishu_verification_token,
-    ).register_p2_im_message_receive_v1(on_receive_message).build()
+    ).register_p2_im_message_receive_v1(on_receive_message) \
+     .register_p2_card_action_trigger(_handle_card_action) \
+     .build()
 
     ws = WSClient(
         app_id=settings.feishu_app_id,

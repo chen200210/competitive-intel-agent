@@ -156,9 +156,14 @@ python -m src.pipeline.runner --date 2026-06-16 --force
 自动跳过已完成的步骤。顺序：
 
 ```
-Phase 1: Differ → Story Picker → Cross Chart
-Phase 2: Overview Scanner → Researcher → Verifier → Analyst → Design Analyst
-Phase 3: Briefer
+Phase 0A: Scrape — 并行抓取 (diandian_batch ‖ taptap_new_games ‖ steam_ports ‖ news_feeds)
+Phase 0B: Loader — CSV 导入 rankings + taptap_new_games + steam_port_games + market_news 表
+Phase 0C: Track Filter — 赛道规则打标 (纯规则, 0 token)
+Phase 1:  Differ → Story Picker → Cross Chart
+Phase 2A: NewGameWatcher ‖ MarketNewsScanner (并行)
+Phase 2B: Overview Scanner → Researcher → Verifier → Analyst
+Phase 3:  Design Analyst → Briefer
+Phase 4:  Push → 飞书卡片
 ```
 
 ### 从爬取到推送一条命令
@@ -170,7 +175,7 @@ python -m src.pipeline.runner --scrape --push oc_xxxxxxxxxxxxx
 这条命令做了四件事：
 
 ```
-Phase 0: diandian_batch.py 抓取 iOS 全 5 榜（免费/畅销/热门/下载/收入）→ 自动导入新 CSV
+Phase 0: diandian_batch.py 抓取 iOS + Android 全榜单 → 自动导入新 CSV
 Phase 1: Differ → Story Picker → Cross Chart
 Phase 2: Overview Scanner → Researcher → Verifier → Analyst → Design Analyst
 Phase 3: Briefer 生成日报卡片
@@ -184,7 +189,7 @@ Phase 4: 推送到飞书群
 | 参数 | 作用 |
 |------|------|
 | `--date 2026-06-16` | 指定日期（不传则用最新） |
-| `--scrape` | 先跑爬虫抓取 iOS 全 5 榜（免费/畅销/热门/下载/收入），再自动导入新 CSV |
+| `--scrape` | 先跑爬虫抓取 iOS + Android 全榜单，再自动导入新 CSV |
 | `--push oc_xxx` | 完成后推送日报卡片到飞书群 |
 | `--force` | 强制重跑所有步骤（不跳过已有数据） |
 | `--verbose` / `-v` | 打印每步耗时 + Agent 工具调用过程 |
@@ -287,11 +292,13 @@ python tests/test_timing.py
 09:00  日报生成 + 推送（一条命令）
          └── python -m src.pipeline.runner --scrape --push oc_xxx
                │
-               ├── Scrape       — 自动抓取 iOS 游戏榜
+               ├── Scrape       — 自动抓取 iOS + Android 全榜单
                ├── Loader       — 导入新 CSV（已有日期 → 跳过）
+               ├── Track Filter — 赛道规则打标（纯规则）
                ├── Differ       — 对比昨日排名（已有 → 跳过）
-               ├── Story Picker — 预选 8 条候选（纯规则，始终运行）
+               ├── Story Picker — 预选候选故事（纯规则，始终运行）
                ├── Cross Chart  — 跨榜信号检测（纯规则）
+               ├── NewGameWatcher / MarketNewsScanner — 新游+新闻分析（新增）
                ├── Overview Scanner — 行业扫描（已有 → 跳过）
                ├── Researcher   — 只调研新上榜/新变动的游戏（已有 → 跳过）
                ├── Verifier     — 只核验新调研结果（已有 → 跳过）

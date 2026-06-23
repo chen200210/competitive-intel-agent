@@ -16,27 +16,11 @@ import sys
 from typing import Any
 
 from src.agents.base import Agent, Tool
-from src.tools.web_search import web_search, TOOL_DESCRIPTOR as SEARCH_DESC
-from src.tools.web_fetch import web_fetch, TOOL_DESCRIPTOR as FETCH_DESC
 
 
 def build_agent(model: str | None = None) -> Agent:
-    """Create an Overview Scanner agent with search + fetch tools."""
-    tools = [
-        Tool(
-            name=SEARCH_DESC["name"],
-            description=SEARCH_DESC["description"],
-            parameters=SEARCH_DESC["parameters"],
-            fn=web_search,
-        ),
-        Tool(
-            name=FETCH_DESC["name"],
-            description=FETCH_DESC["description"],
-            parameters=FETCH_DESC["parameters"],
-            fn=web_fetch,
-        ),
-    ]
-    return Agent("overview_scanner", tools=tools, model=model)
+    """Create an Overview Scanner agent — pure reasoning, no search tools."""
+    return Agent("overview_scanner", tools=None, model=model)
 
 
 def _build_overview_from_changes(
@@ -262,14 +246,14 @@ def _build_sector_context() -> str:
         "  1. 如果一款游戏的名称/品类/题材匹配以上任何关键词 → 它就不能被放入 skip_deep_research_for",
         "     即使排名波动看起来是'正常波动'或'榜单重置'，也必须放入 recommended_focus。",
         "  2. daily_overview 的 recommended_focus 中，至少要有 2 条与赛道相关",
-        "     （塔防品类 或 微恐/冰河/火山题材）。如果当天确实没有匹配的变动，",
+        "     （塔防品类 或 肉鸽品类）。如果当天确实没有匹配的变动，",
         "     在 skip 中注明「今日无赛道相关变动」。",
         "  3. 赛道匹配游戏在 recommended_focus 中的排序仅次于跨榜高威胁信号，",
         "     高于所有其他单榜信号。",
         "  4. 塔防品类关键词: 塔防、TD、Tower Defense、Kingdom Rush、王国保卫战、",
         "     保卫萝卜、地牢、 Dungeon 、Defense。只要游戏名或分类含这些词 → 匹配。",
         "",
-        "  为什么: 你们公司的业务方向是塔防品类 + 微恐/冰河/火山题材。这些游戏的",
+        "  为什么: 你们公司的业务方向是塔防品类 + 肉鸽品类。这些游戏的",
         "  每一次排名变动都是直接竞争情报，漏掉任何一条都意味着情报失误。",
         "",
     ])
@@ -288,21 +272,20 @@ def scan(
 ) -> dict[str, Any]:
     """Run the Overview Scanner for a given date.
 
+    Only processes track-relevant changes — the caller (runner.py) is
+    responsible for pre-filtering via track_filter before calling scan().
+
     Args:
         date: Date string YYYY-MM-DD.
         platform: Platform filter (iOS / Android).
         overview: Day overview dict (auto-computed from changes if not provided).
-        changes: List of changes from Differ (top 30 sent to LLM).
-        story_pool: Pre-picked story candidates from Story Picker (including cross_chart
-                    signals). Used as context for the agent's final 5–8 cut.
+        changes: List of track-relevant changes from Differ (pre-filtered by caller).
+        story_pool: Pre-picked story candidates from Story Picker.
         cross_chart_signals: Raw cross-chart signals from Cross-Chart module.
-                             Rendered as a prominent, hard-to-miss context block
-                             separate from the story pool hint.
         verbose: Print tool call traces to stderr.
 
     Returns:
-        dict with industry_news_today, volatility_context,
-        recommended_focus (5–8 items), skip_deep_research_for.
+        dict with volatility_context, recommended_focus, skip_deep_research_for.
     """
     from src.storage.sqlite import get_db
     db = get_db()
@@ -320,7 +303,8 @@ def scan(
     # Limit context: send top 30 changes by attention_score
     top_changes = sorted(changes, key=lambda c: c.get("attention_score", 0), reverse=True)[:30]
 
-    # Build change list with explicit id + bundle_id fields
+    # Build change list with essential fields only (no platform/rank detail —
+    # LLM will add those to search queries if given, producing bad results)
     changes_for_llm = []
     for c in top_changes:
         changes_for_llm.append({
@@ -328,10 +312,6 @@ def scan(
             "game_name": c.get("game_name", ""),
             "bundle_id": c.get("bundle_id", ""),
             "developer": c.get("developer"),
-            "chart_type": c.get("chart_type", ""),
-            "today_rank": c.get("today_rank"),
-            "yesterday_rank": c.get("yesterday_rank"),
-            "rank_change": c.get("rank_change"),
             "change_type": c.get("change_type", ""),
             "attention_score": c.get("attention_score", 0),
             "is_significant": bool(c.get("is_significant", False)),
@@ -346,9 +326,6 @@ def scan(
     # ── Build cross-chart context (hard to miss) ──
     cross_chart_context = _build_cross_chart_context(cross_chart_signals)
 
-    # ── Build sector context (business focus from competitor_list.yaml) ──
-    sector_context = _build_sector_context()
-
     agent = build_agent()
     result = agent.run(
         date=date,
@@ -357,7 +334,6 @@ def scan(
         changes_json=changes_json,
         story_pool_hint=story_pool_hint,
         cross_chart_context=cross_chart_context,
-        sector_context=sector_context,
         _verbose=verbose,
     )
 
@@ -424,7 +400,7 @@ def scan(
         date=date,
         day_type=day_type,
         volatility=volatility,
-        industry_news_json=json.dumps(result.get("industry_news_today", []), ensure_ascii=False),
+        industry_news_json="[]",
         recommended_focus_json=json.dumps(recommended, ensure_ascii=False),
         skip_json=json.dumps(skip_items, ensure_ascii=False),
         run_id=run_id,

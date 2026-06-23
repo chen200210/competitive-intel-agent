@@ -85,9 +85,9 @@ def analyze(
 
     # Target sector defaults (aligned with competitor_list.yaml)
     sector = target_sector or {
-        "genres": ["塔防", "移动塔防", "传统TD塔防", "移动城堡like"],
-        "themes": ["微恐", "冰河", "火山爆发"],
-        "note": "关注已被市场验证的塔防玩法 + 目标题材方向",
+        "genres": ["塔防", "TD", "Tower Defense", "肉鸽", "Roguelike", "Roguelite"],
+        "themes": [],
+        "note": "关注塔防品类 + 肉鸽品类",
     }
 
     agent = build_agent()

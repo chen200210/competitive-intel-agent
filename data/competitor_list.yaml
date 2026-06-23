@@ -9,10 +9,10 @@ business_focus:
     - "移动塔防"
     - "传统TD塔防"
     - "移动城堡like"
-  themes:
-    - "微恐"        # 轻度恐怖
-    - "冰河"        # 冰雪/冰川题材
-    - "火山爆发"     # 火山/熔岩题材
+    - "肉鸽"
+    - "Roguelike"
+    - "Roguelite"
+  themes: []
   validated_mechanisms:
     - "已被市场验证的塔防玩法"
     - "已验证的商业化模型"
@@ -25,6 +25,31 @@ monitored_games: []
 # 按 DESIGN.md 7.3 节定义
 in_development_tracking: []
 
+# === 赛道筛选配置 ===
+# 规则：
+#   1. track 关键词命中 → 必然关注（赛道覆盖规则优先于可无视类别）
+#   2. ignored 类别命中且未命中 track → 排除
+#   3. 既未命中 track 也未命中 ignored → neutral（正常关注）
+#   例: 明日方舟(tag:塔防+二次元) → 塔防命中 → 关注（赛道规则优先）
+track_config:
+  genres:
+    - "塔防"
+    - "TD"
+    - "Tower Defense"
+    - "肉鸽"
+    - "Roguelike"
+    - "Roguelite"
+  ignored_categories:
+    - "女性向"
+    - "二次元"
+    - "乙女"
+  track_overrides_ignore: true
+  steam_port_always_include: true
+  note: |
+    赛道关键词命中 → 无论是否命中可无视类别，一律关注。
+    可无视类别仅在不命中赛道时生效。
+    Steam移植手游不论赛道是否沾边都应调查其玩法和tag。
+
 # === 显著性判定阈值 ===
 significance_thresholds:
   rank_change_min: 3
@@ -36,5 +61,5 @@ significance_thresholds:
   genre_boost:
     - genre: "塔防"
       boost: 2.0
-    - theme: ["微恐", "冰河", "火山爆发"]
-      boost: 1.5
+    - genre: "肉鸽"
+      boost: 2.0

@@ -81,6 +81,121 @@ def _search_tavily(query: str, max_results: int = 5) -> str:
     return result_str
 
 
+# ── 360 Search (primary for Chinese queries) ──────────────────
+
+def _scrape_360(query: str, max_results: int = 5) -> str:
+    """Scrape 360 Search (so.com) — excellent Chinese game search results.
+
+    Unlike Sogou/Bing, 360 actually returns game-related pages for
+    Chinese game queries, not dictionary definitions.
+    """
+    resp = httpx.get(
+        "https://www.so.com/s",
+        params={"q": query},
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: list[dict[str, str]] = []
+
+    for item in soup.select(".res-list, .result")[:max_results]:
+        title_el = item.select_one("h3 a") or item.select_one("a")
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+
+        snippet_el = item.select_one(".res-desc, .res-summary, p")
+        snippet = snippet_el.get_text(strip=True)[:300] if snippet_el else ""
+
+        if title:
+            results.append({
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+            })
+
+    if not results:
+        return json.dumps(
+            {"query": query, "results": [], "engine": "360",
+             "note": "No results found."},
+            ensure_ascii=False,
+        )
+
+    return json.dumps({"query": query, "results": results, "engine": "360"}, ensure_ascii=False)
+
+
+# ── Sogou (fallback) ───────────────────────────────────────────
+
+def _scrape_sogou(query: str, max_results: int = 5) -> str:
+    """Scrape Sogou search results — excellent Chinese + English game search.
+
+    Accessible from China without proxy. Includes a small delay to avoid
+    rate-limiting during parallel agent calls.
+    """
+    import time
+    time.sleep(0.3)  # anti-rate-limit: 300ms between requests
+
+    resp = httpx.get(
+        "https://www.sogou.com/web",
+        params={"query": query},
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: list[dict[str, str]] = []
+
+    # Detect captcha / verification page
+    if "验证码" in resp.text or "异常请求" in resp.text:
+        return json.dumps(
+            {"query": query, "results": [], "engine": "sogou",
+             "note": "Sogou captcha triggered — will retry on next call."},
+            ensure_ascii=False,
+        )
+
+    for item in soup.select("div.results > div")[:max_results]:
+        title_el = item.select_one("h3 a")
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+
+        # Sogou uses redirect URLs — keep as-is for web_fetch to follow
+        if href.startswith("/"):
+            href = f"https://www.sogou.com{href}"
+
+        snippet_el = item.select_one(".str-text, .space-txt, .abstract, p")
+        snippet = snippet_el.get_text(strip=True)[:300] if snippet_el else ""
+
+        if title:
+            results.append({
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+            })
+
+    if not results:
+        return json.dumps(
+            {"query": query, "results": [], "engine": "sogou",
+             "note": "No results found. Sogou may have changed their HTML structure."},
+            ensure_ascii=False,
+        )
+
+    return json.dumps({"query": query, "results": results, "engine": "sogou"}, ensure_ascii=False)
+
+
 # ── Bing (fallback) ────────────────────────────────────────────
 
 def _scrape_bing(query: str, max_results: int = 5) -> str:
@@ -210,7 +325,8 @@ def web_search(query: str, max_results: int = 5, **_meta: Any) -> str:
 
     # ── Real search: try engines in order ──
     engines = [
-        ("tavily", _search_tavily),
+        ("360", _scrape_360),
+        ("sogou", _scrape_sogou),
         ("bing", _scrape_bing),
         ("ddg", _scrape_ddg),
     ]

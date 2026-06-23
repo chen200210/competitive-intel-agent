@@ -6,6 +6,8 @@
 
 ## Skill 1：`/daily-report` — 日报一键生成+推送
 
+**状态**：✅ 已实现（`.claude/skills/daily-report.md`）
+
 **日活频率**：每天 1 次
 
 **当前操作**：
@@ -29,6 +31,8 @@ python -m src.pipeline.runner --scrape --push oc_xxx --verbose
 ---
 
 ## Skill 2：`/audit <date>` — 日报质量审计
+
+**状态**：✅ 已实现（`.claude/skills/audit.md`）
 
 **日活频率**：每天 1 次（日报跑完后）
 
