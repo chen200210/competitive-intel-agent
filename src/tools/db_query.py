@@ -88,18 +88,6 @@ Common queries you can adapt:
     FROM changes WHERE bundle_id = 'com.xxx'
     ORDER BY date DESC LIMIT 14
 
-  Daily overview (volatility context):
-    SELECT date, day_type, volatility FROM daily_overviews
-    WHERE date >= '2026-06-01' ORDER BY date DESC
-
-  Cross-chart signals:
-    SELECT * FROM cross_chart_signals WHERE date = '2026-06-16'
-
-  In-development competitors:
-    SELECT company, product_name, genre, theme, status, threat_level
-    FROM in_development_tracking ORDER BY
-      CASE threat_level WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
-
   Recent search cache (what was searched before):
     SELECT query, engine, result_count, searched_at FROM search_cache
     ORDER BY searched_at DESC LIMIT 10
@@ -167,15 +155,15 @@ TOOL_DESCRIPTOR: dict[str, Any] = {
         "Execute a read-only SQL query against the project database. "
         "Only SELECT queries are allowed. "
         "Use this to look up historical ranking data, game trends, "
-        "volatility context, past analysis results, and cross-chart signals.\n\n"
+        "volatility context, and past analysis results.\n\n"
         "Available tables:\n"
         "  rankings — daily ranking snapshots (date, platform, chart_type, rank, bundle_id, game_name, developer)\n"
         "  changes  — daily change records (date, change_type, today_rank, yesterday_rank, rank_change, attention_score, is_significant)\n"
-        "  daily_overviews — Overview Scanner output (date, day_type, volatility, industry_news_json)\n"
-        "  research_results — Researcher output (change_id, findings_json, verified_json)\n"
-        "  analysis_reports — Analyst + Briefer output (date, report_json, design_analysis_json, brief_card_json)\n"
-        "  cross_chart_signals — cross-chart pattern detection (date, bundle_id, signal_pattern, threat_level)\n"
-        "  in_development_tracking — competitor pipeline tracking (company, product_name, genre, theme, status, threat_level)\n"
+        "  analysis_reports — Briefer output (date, brief_card_json, new_games_md, market_md, ranking_md)\n"
+        "  market_news — news headlines (date, headline, source, url, track_relevant)\n"
+        "  taptap_new_games — TapTap daily new games (date, game_name, tags, track_relevant)\n"
+        "  steam_port_games — Steam-to-mobile ports (date, game_name, gameplay_tags)\n"
+        "  bilibili_videos — B站 creator video monitor (date, bvid, title, ai_subtitle)\n"
         "\n"
         + COMMON_QUERIES
     ),

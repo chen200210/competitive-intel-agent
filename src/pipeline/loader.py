@@ -105,8 +105,15 @@ def extract_chart_type_from_filename(file_path: str | Path) -> str:
       - "android_top_grossing_20260616.csv"      → "畅销榜"
 
     Returns "热门榜" as default if no known keyword is found.
+    Returns None if the file is NOT a ranking CSV (news, new games, etc.).
     """
     name = Path(file_path).name
+
+    # Non-ranking files from other scrapers — skip these
+    non_ranking_markers = ["资讯", "Steam移植", "新游", "B站", "bilibili", "steam_port"]
+    for marker in non_ranking_markers:
+        if marker in name:
+            return None
 
     # Known chart type keywords (order matters — longer match first)
     keywords = ["热门榜", "免费榜", "畅销榜", "新品榜", "下载榜", "收入榜",
@@ -260,6 +267,9 @@ def import_file(
 
     if chart_type is None:
         chart_type = extract_chart_type_from_filename(file_path)
+        if chart_type is None:
+            return {"imported": 0, "date": date, "skipped": True,
+                    "reason": "not a ranking file"}
 
     suffix = file_path.suffix.lower()
     if suffix == ".xlsx":

@@ -83,17 +83,44 @@ def image_fetch(url: str, **_meta: Any) -> str:
                     seen.add(img_url)
                     images.append({"url": img_url, "type": "icon"})
 
-        # Fallback: find first <img> with reasonable size
+        # Fallback: find first <img> with reasonable size, skip ads/qr/logos
         if not images:
+            candidate_imgs = []
             for img in soup.find_all("img"):
                 src = img.get("src", "")
-                if src:
-                    img_url = urljoin(url, src)
-                    if img_url not in seen and _is_valid_image_url(img_url):
-                        seen.add(img_url)
-                        images.append({"url": img_url, "type": "img_tag"})
-                        if len(images) >= 3:
-                            break
+                if not src:
+                    continue
+                img_url = urljoin(url, src)
+                if img_url in seen or not _is_valid_image_url(img_url):
+                    continue
+
+                # Skip images that are too small (likely icons, QR codes, ads)
+                w = _parse_dimension(img.get("width"))
+                h = _parse_dimension(img.get("height"))
+                if (w is not None and w < 200) or (h is not None and h < 200):
+                    continue
+
+                # Check parent context: prefer images in article/content areas
+                parent_score = _parent_context_score(img)
+
+                seen.add(img_url)
+                candidate_imgs.append({
+                    "url": img_url,
+                    "type": "img_tag",
+                    "width": str(w) if w else "",
+                    "height": str(h) if h else "",
+                    "parent_score": parent_score,
+                })
+
+            # Sort by parent score (article content first), then take top 3
+            candidate_imgs.sort(key=lambda x: x.get("parent_score", 0), reverse=True)
+            for ci in candidate_imgs[:3]:
+                images.append({
+                    "url": ci["url"],
+                    "type": ci["type"],
+                    "width": ci.get("width", ""),
+                    "height": ci.get("height", ""),
+                })
 
         return json.dumps({
             "url": str(resp.url),
@@ -108,13 +135,76 @@ def image_fetch(url: str, **_meta: Any) -> str:
 
 
 def _is_valid_image_url(url: str) -> bool:
-    """Basic check that a URL looks like an image."""
+    """Basic check that a URL looks like an image (not a logo/icon/tracker/ad/qr)."""
     if not url.startswith(("http://", "https://")):
         return False
-    # Skip tracking pixels and tiny icons
-    skip_patterns = ["1x1", "pixel", "tracking", "favicon", "beacon"]
+    skip_patterns = [
+        # Tracking / tiny
+        "1x1", "pixel", "tracking", "favicon", "beacon",
+        # Site logos & icons
+        "/logo.", "/logo-", "logo.png", "logo.jpg", "logo.svg", "logo.webp",
+        "/icon.", "icon.png", "icon.jpg",
+        "apple-touch-icon",
+        "avatar", "default-avatar",
+        # Ads & QR codes
+        "qr.png", "qr.jpg", "qrcode", "qr_code", "qr-code",
+        "banner-ad", "banner_ad", "/ad.", "/ad-",
+        "广告", "二维码",
+        # Analytics / beacons
+        "analytics", "pixel", "spacer",
+    ]
     url_lower = url.lower()
     return not any(p in url_lower for p in skip_patterns)
+
+
+def _parse_dimension(val: Any) -> int | None:
+    """Parse width/height attribute value to integer, handling '100px' or '50%'."""
+    if val is None:
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            return int(val)
+        s = str(val).strip().rstrip("px").rstrip("%")
+        if s:
+            return int(float(s))
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _parent_context_score(img_tag: Any) -> int:
+    """Score an <img> by how likely it's inside article content vs sidebar/ad.
+
+    Higher = article image.  Lower = ad / QR code / decoration.
+    """
+    score = 0
+    parent = img_tag.parent
+    depth = 0
+    while parent is not None and depth < 6:
+        depth += 1
+        tag_name = (getattr(parent, 'name', '') or '').lower()
+        classes = ' '.join(getattr(parent, 'attrs', {}).get('class', [])) if hasattr(parent, 'attrs') else ''
+        parent_id = getattr(parent, 'attrs', {}).get('id', '') if hasattr(parent, 'attrs') else ''
+
+        combined = f"{tag_name} {classes} {parent_id}".lower()
+
+        # Strong positive: article content area
+        if any(kw in combined for kw in ('article', 'content', 'detail', 'post', 'entry', 'main')):
+            score += 3
+        # Weak positive: text area
+        if any(kw in combined for kw in ('text', 'body', 'desc', 'para')):
+            score += 1
+        # Negative: sidebar, footer, ad, widget
+        if any(kw in combined for kw in ('sidebar', 'footer', 'ad-', 'ad_', '-ad', '_ad',
+                                          'widget', 'recommend', 'related')):
+            score -= 3
+        # Strong negative: QR code area
+        if any(kw in combined for kw in ('qr', 'qrcode', 'code')):
+            score -= 5
+
+        parent = parent.parent if hasattr(parent, 'parent') else None
+
+    return score
 
 
 # ── Tool descriptor for Agent registration ──────────────────────

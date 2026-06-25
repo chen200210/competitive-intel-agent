@@ -28,8 +28,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -70,36 +68,6 @@ class SteamPorts(ChartScraper):
         "steam_rank_with_comment",
         "steam_bar",
     ]
-
-    def __init__(self, output_dir: Path | None = None):
-        super().__init__(output_dir=output_dir)
-        self._client: httpx.Client | None = None
-
-    def _get_client(self) -> httpx.Client:
-        if self._client is None:
-            self._client = httpx.Client(
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                },
-                timeout=httpx.Timeout(20.0),
-                follow_redirects=True,
-            )
-        return self._client
-
-    def _clean(self, raw_rows: list[dict[str, Any]], date: str) -> list[dict[str, str]]:
-        cleaned = super()._clean(raw_rows, date)
-        for raw, clean in zip(raw_rows, cleaned):
-            for col in self.EXTRA_COLUMNS:
-                val = raw.get(col, "")
-                if val is not None and val != "":
-                    clean[col] = str(val)
-        return cleaned
 
     # ═════════════════════════════════════════════════════════════
     # Scrape
@@ -181,16 +149,21 @@ class SteamPorts(ChartScraper):
     ) -> dict[str, Any] | None:
         """Check if a game is a Steam-to-mobile port.
 
-        Detection paths (in order):
-          1. TapTap page → Steam-integration JSON markers (definitive)
-          2. TapTap page → textual port keywords ("移植", "steam移植", etc.)
-          3. Fallback: web_search for port evidence (non-TapTap games)
+        Detection paths (in order of confidence):
+          1. TapTap Steam-integration JSON markers → definitive (Path A)
+          2. TapTap page → textual port keywords + "steam" mention → probable (Path B)
+          3. Fallback: web_search for port evidence (non-TapTap games only)
+
+        Path B requires BOTH a port keyword AND "steam" on the page.
+        "端游"+"移植" as separate mentions is no longer sufficient on its own —
+        too many games describe themselves as "端游品质" and "移植了经典玩法"
+        without being actual Steam→mobile ports.
 
         Returns minimal dict with game_name + is_steam_port=1, or None.
         """
         if taptap_url:
-            has_port, _has_steam = self._analyze_tap_page(taptap_url)
-            if has_port:
+            has_port, has_steam = self._analyze_tap_page(taptap_url)
+            if has_port and has_steam:
                 return {
                     "rank": 0,
                     "game_name": game_name,
@@ -199,8 +172,10 @@ class SteamPorts(ChartScraper):
                     "is_steam_port": 1,
                 }
 
-        # Fallback: web_search for port evidence (non-TapTap games)
-        if self._web_search_port_evidence(game_name):
+        # Fallback: web_search only for games without TapTap URL.
+        # If TapTap analysis ran and returned False, trust that result —
+        # web_search produces false positives for generic game names.
+        if not taptap_url and self._web_search_port_evidence(game_name):
             return {
                 "rank": 0,
                 "game_name": game_name,
@@ -217,6 +192,15 @@ class SteamPorts(ChartScraper):
         """Analyze a TapTap game page for Steam and port signals.
 
         Returns (has_port_signal, has_steam_mention).
+
+        Confidence tiers:
+          - Path A: Steam-integration JSON markers → port signal regardless of text
+          - Path B: Textual port keywords AND "steam" on the page → probable port
+          - No signal: otherwise
+
+        The weak signal (端游 + 移植 as separate mentions without "steam")
+        is intentionally excluded — too many games use these words in unrelated
+        contexts ("端游品质", "移植了经典玩法").
         """
         try:
             client = self._get_client()
@@ -229,42 +213,44 @@ class SteamPorts(ChartScraper):
         page_lower = page_text.lower()
 
         # ── Path A: TapTap Steam-integration markers (most reliable) ──
-        # These JSON keys only appear when TapTap links a Steam App ID.
-        # A game on TapTap (mobile) with Steam integration = Steam→mobile port.
         has_steam_integration = any(m in page_lower for m in self.STEAM_INTEGRATION_MARKERS)
 
-        # ── Path B: Textual port signals ──
-        has_duanyou = "端游" in page_text
-        has_yizhi = "移植" in page_text
-        has_pc_port = ("pc" in page_lower and has_yizhi)
+        # ── Steam mention on page ──
+        has_steam = "steam" in page_lower
 
+        # ── Path B: Textual port signals (require steam mention) ──
         specific_port_signals = [
             "steam移植", "pc移植",
             "从steam移植", "从pc移植",
             "steam原版", "pc原版",
             "已在steam发售",
-            "端游移植",
+            "端游移植",       # contiguous phrase — strong signal
         ]
         has_specific = any(s in page_lower for s in specific_port_signals)
 
-        has_port_signal = (
-            has_steam_integration
-            or has_specific
-            or (has_duanyou and has_yizhi)
-            or has_pc_port
-        )
+        # 端游 + 移植 as co-occurring terms (weaker than contiguous phrase)
+        has_duanyou = "端游" in page_text
+        has_yizhi = "移植" in page_text
+        has_duanyou_yizhi = has_duanyou and has_yizhi
 
-        # ── Steam mention ──
-        has_steam = "steam" in page_lower
+        # ── Decision ──
+        if has_steam_integration:
+            # Path A: definitive — always a port signal
+            has_port_signal = True
+        elif has_steam:
+            # Path B: textual signals + steam mention on page
+            has_port_signal = has_specific or has_duanyou_yizhi
+        else:
+            # No steam mention at all — can't be a Steam port
+            has_port_signal = False
 
         # ── Multi-platform signals (weaken port claim) ──
-        # Steam-integration markers override multi-platform signals
-        # because they are definitive proof of a Steam version.
-        if not has_steam_integration:
+        # Only applies to Path B detections (not Steam integration)
+        if has_port_signal and not has_steam_integration:
             multi_signals = ["双端上线", "多端上线", "同步上线", "同步发售", "全平台"]
             if any(s in page_text for s in multi_signals):
                 port_count = sum(page_lower.count(s) for s in specific_port_signals)
-                port_count += (1 if (has_duanyou and has_yizhi) else 0)
+                port_count += (1 if has_duanyou_yizhi else 0)
                 multi_count = sum(page_text.count(s) for s in multi_signals)
                 if multi_count >= port_count:
                     has_port_signal = False
@@ -363,8 +349,15 @@ def _sync_to_db(csv_path: Path, date: str) -> None:
                     "track_relevant": True,
                 })
             if records:
+                # Clear today's old data before insert (removes false positives
+                # from previous runs with looser detection criteria)
+                with db._connect() as conn:
+                    conn.execute(
+                        "DELETE FROM steam_port_games WHERE date = ?", (date,)
+                    )
+                    conn.commit()
                 db.insert_steam_ports(records)
-                print(f"  📊 Synced {len(records)} games to steam_port_games table")
+                print(f"  [steam] Synced {len(records)} games to steam_port_games table")
     except Exception as e:
         print(f"  [WARN] DB sync failed: {e}")
 

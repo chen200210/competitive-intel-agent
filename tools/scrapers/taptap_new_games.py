@@ -21,8 +21,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 # Fix import path for running as script or module
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -63,39 +61,7 @@ class TapTapNewGames(ChartScraper):
         "reserve_count": "reserve_count",
     }
 
-    def __init__(self, output_dir: Path | None = None):
-        super().__init__(output_dir=output_dir)
-        self._client: httpx.Client | None = None
-
-    def _clean(self, raw_rows: list[dict[str, Any]], date: str) -> list[dict[str, str]]:
-        """Override to preserve extra TapTap-specific columns."""
-        cleaned = super()._clean(raw_rows, date)
-        # Merge back extra fields that base._clean() strips
-        for raw, clean in zip(raw_rows, cleaned):
-            for col in self.EXTRA_COLUMNS:
-                val = raw.get(col, "")
-                if val is not None and val != "":
-                    clean[col] = str(val)
-        return cleaned
-
-    def _get_client(self) -> httpx.Client:
-        if self._client is None:
-            self._client = httpx.Client(
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                },
-                timeout=httpx.Timeout(20.0),
-                follow_redirects=True,
-            )
-        return self._client
-
-    # ── Scrape ─────────────────────────────────────────────────
+    # Map scraper-native columns → internal field names
 
     def scrape(self) -> list[dict[str, Any]]:
         """Fetch and parse TapTap app-calendar page.
@@ -424,6 +390,24 @@ def _sync_to_db(csv_path: Path, date: str) -> None:
                     rating = float(rating_str) if rating_str else None
                 except (ValueError, TypeError):
                     rating = None
+                # Run track_filter to classify
+                try:
+                    from src.pipeline.track_filter import classify_game
+                    tags_raw = row.get("tags", "")
+                    tag_list = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+                    # Detect Steam port from tags
+                    is_steam = any("steam" in t.lower() or "移植" in t for t in tag_list)
+                    track_label = classify_game(
+                        game_name=game_name,
+                        genre=row.get("品类", ""),
+                        tags=tag_list if tag_list else None,
+                        description=row.get("description", ""),
+                        is_steam_port=is_steam,
+                    )
+                    track_relevant = track_label == "track"
+                except Exception:
+                    track_relevant = False
+
                 records.append({
                     "date": date,
                     "game_name": game_name,
@@ -434,11 +418,11 @@ def _sync_to_db(csv_path: Path, date: str) -> None:
                     "genre": row.get("品类", ""),
                     "description": row.get("description", ""),
                     "taptap_url": row.get("taptap_url", ""),
-                    "track_relevant": False,
+                    "track_relevant": track_relevant,
                 })
             if records:
                 db.insert_taptap_games(records)
-                print(f"  📊 Synced {len(records)} games to taptap_new_games table")
+                print(f"  [taptap] Synced {len(records)} games to taptap_new_games table")
     except Exception as e:
         print(f"  [WARN] DB sync failed: {e}")
 

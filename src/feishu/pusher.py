@@ -26,6 +26,13 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _unwrap_card(card: dict[str, Any]) -> dict[str, Any]:
+    """If card is a {msg_type, card} wrapper, return the inner card body."""
+    if "card" in card and "header" not in card:
+        return card["card"]
+    return card
+
+
 # ── Token management ────────────────────────────────────────────
 
 def _get_client() -> lark.Client:
@@ -105,9 +112,7 @@ def push_card(
     Returns:
         dict with success/error.
     """
-    # Unwrap if caller passed {msg_type, card} wrapper
-    if "card" in card and "header" not in card:
-        card = card["card"]
+    card = _unwrap_card(card)
     content = json.dumps(card, ensure_ascii=False)
     return send_message(content, msg_type="interactive", chat_id=chat_id)
 
@@ -176,8 +181,7 @@ def find_user_by_email(email: str) -> dict[str, Any]:
 
 def push_to_user(card: dict[str, Any], open_id: str) -> dict[str, Any]:
     """Push an interactive card to a user's private chat."""
-    if "card" in card and "header" not in card:
-        card = card["card"]
+    card = _unwrap_card(card)
     content = json.dumps(card, ensure_ascii=False)
     return send_message(content, msg_type="interactive",
                         receive_id=open_id, receive_id_type="open_id")
@@ -210,15 +214,6 @@ def push_daily_card(
         card_data = json.loads(report["brief_card_json"])
         card = card_data.get("card", card_data)
 
-        # 🆕 Enrich with diandian search action buttons
-        try:
-            taptap_games = db.get_taptap_games_by_date(date)
-            if taptap_games:
-                from src.feishu.card_builder import enrich_card_with_diandian_actions
-                card = enrich_card_with_diandian_actions(card, taptap_games)
-        except Exception:
-            pass  # enrichment is optional — don't block push
-
         return push_card(card, chat_id)
     except json.JSONDecodeError as e:
         return {"error": f"Failed to parse card JSON: {e}"}
@@ -229,25 +224,62 @@ def upload_image(image_url: str) -> dict[str, Any]:
     import httpx
 
     try:
-        resp = httpx.get(image_url, headers={
+        # Build headers — B站 requires Referer to prevent hotlink 403
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }, timeout=15.0, follow_redirects=True)
+        }
+        url_lower = image_url.lower()
+        if "hdslb.com" in url_lower or "bilibili.com" in url_lower:
+            headers["Referer"] = "https://www.bilibili.com"
+
+        resp = httpx.get(image_url, headers=headers,
+                         timeout=15.0, follow_redirects=True)
         resp.raise_for_status()
 
         image_bytes = resp.content
         content_type = "image/png"
 
-        # Detect and convert WebP/unsupported formats to JPEG
+        # Detect format, check size, resize, convert
         try:
             from PIL import Image
             import io
             img = Image.open(io.BytesIO(image_bytes))
             fmt = img.format
+            width, height = img.width, img.height
+            file_kb = len(image_bytes) / 1024
+
+            # Reject images that are too small — likely icons, logos, QR codes
+            min_dim = 200
+            min_kb = 5
+            if width < min_dim or height < min_dim:
+                return {"error": f"image too small ({width}x{height}), likely icon/logo, skipped"}
+            if file_kb < min_kb:
+                return {"error": f"image too tiny ({file_kb:.1f}KB), likely icon, skipped"}
+
+            # Resize if image is too large for card display
+            # Max 800px wide, 600px tall
+            max_width = 800
+            max_height = 600
+
+            if width > max_width or height > max_height:
+                ratio = min(max_width / width, max_height / height)
+                new_size = (int(width * ratio), int(height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+
             if fmt and fmt.upper() not in ("PNG", "JPEG", "GIF", "JPG"):
                 buf = io.BytesIO()
                 img.convert("RGB").save(buf, format="JPEG", quality=85)
                 image_bytes = buf.getvalue()
                 content_type = "image/jpeg"
+            else:
+                # Re-save even supported formats to apply resize + compress
+                buf = io.BytesIO()
+                save_fmt = "JPEG" if fmt and fmt.upper() in ("JPG", "JPEG") else fmt or "PNG"
+                if save_fmt in ("JPEG", "JPG"):
+                    img = img.convert("RGB")
+                img.save(buf, format=save_fmt, quality=85)
+                image_bytes = buf.getvalue()
+                content_type = f"image/{save_fmt.lower()}"
         except Exception:
             pass  # keep original bytes if conversion fails
 
@@ -279,33 +311,52 @@ def upload_image(image_url: str) -> dict[str, Any]:
 def upload_images_for_card(
     card: dict[str, Any],
     image_urls: list[str],
+    insert_after_index: int = 0,
 ) -> dict[str, Any]:
     """Download images from URLs, upload to Feishu, embed into card.
 
-    Replaces placeholder img tags in the card with real Feishu image_keys.
+    Args:
+        card: Feishu card dict.
+        image_urls: List of image URLs to download & upload.
+        insert_after_index: Insert img elements after this index in
+            card['elements'].  E.g. 0 = after the first element,
+            1 = after the second.  Default 0 (right after header/first section).
+
+    Returns:
+        The card dict with img elements inserted (mutated in place).
     """
     if not image_urls:
         return card
 
+    import sys
     uploaded_keys: list[str] = []
     for url in image_urls[:3]:  # max 3 images per card
         result = upload_image(url)
         if result.get("success"):
             uploaded_keys.append(result["image_key"])
+            print(f"   [image] uploaded: {url[:80]}... -> {result['image_key'][:20]}...", file=sys.stderr)
+        else:
+            print(f"   [image] upload FAILED: {url[:80]}... -> {result.get('error', 'unknown')}", file=sys.stderr)
 
     if not uploaded_keys:
+        print(f"   [image] all uploads failed, no images in card", file=sys.stderr)
         return card
 
-    # Add images to the top of the card elements (after header)
-    elements = card.get("elements", [])
-    for key in uploaded_keys:
-        elements.insert(0, {
+    inner = _unwrap_card(card)
+
+    # Insert images at the specified position
+    elements = inner.get("elements", [])
+    insert_at = min(insert_after_index + 1, len(elements))
+    for key in reversed(uploaded_keys):
+        elements.insert(insert_at, {
             "tag": "img",
             "img_key": key,
             "alt": {"tag": "plain_text", "content": ""},
         })
 
-    card["elements"] = elements
+    inner["elements"] = elements
+    if inner is not card:
+        card["card"] = inner
     return card
 
 

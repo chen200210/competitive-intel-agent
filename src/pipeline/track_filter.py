@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import functools
 import sys
 from typing import Any
 
@@ -30,10 +31,11 @@ from typing import Any
 
 DEFAULT_TRACK_KEYWORDS: list[str] = [
     # CN
-    "塔防", "肉鸽",
+    "塔防", "肉鸽", "割草",
     # EN
     "TD", "Tower Defense", "tower defense",
     "Roguelike", "roguelike", "Roguelite", "roguelite",
+    "Vampire Survivors", "Survivors-like",
 ]
 
 DEFAULT_IGNORED_KEYWORDS: list[str] = [
@@ -47,7 +49,18 @@ TRACK_BRAND_SIGNALS: list[str] = [
     "Dungeon Defense", "地牢防御",
 ]
 
+# Well-known game names / brands in ignored categories (女性向, 二次元, 乙女).
+# When these appear in game_name, the game is classified as 'ignored' unless
+# a track keyword also matches (track always overrides).
+IGNORED_BRAND_SIGNALS: list[str] = [
+    "恋与深空", "恋与制作人", "光与夜之恋",
+    "闪耀暖暖", "奇迹暖暖", "无限暖暖",
+    "未定事件簿", "时空中的绘旅人", "世界之外",
+    "恋与",  # catch-all prefix for 恋与 series
+]
 
+
+@functools.lru_cache(maxsize=1)
 def _load_track_config() -> dict[str, Any]:
     """Load track_config from competitor_list.yaml.
 
@@ -160,6 +173,10 @@ def classify_game(
     if _keyword_in_text(ignored_keywords, combined):
         return "ignored"
 
+    # Check ignored brand signals (game names known to be in ignored categories)
+    if _keyword_in_text(IGNORED_BRAND_SIGNALS, combined):
+        return "ignored"
+
     # ── Rule 3: Neutral ──
     return "neutral"
 
@@ -228,6 +245,51 @@ def _parse_tags(tags_value: str | list[str] | None) -> list[str]:
     return []
 
 
+def filter_track_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter a list of change dicts to track-relevant games only.
+
+    Uses classify_game() for primary classification (brand signals, Steam ports,
+    keyword matching). Also checks monitored_games from competitor_list.yaml
+    as a bonus — games explicitly listed as monitored always pass.
+
+    This is the SINGLE canonical implementation.  runner, briefer, and
+    taptap_resolver all use this function.
+    """
+    # ── Load monitored game names from YAML ──
+    monitored_names: set[str] = set()
+    try:
+        import yaml
+        from src.config import settings
+        yaml_path = settings.competitor_list_path
+        if yaml_path.exists():
+            with open(yaml_path, encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            for g in config.get("monitored_games", []):
+                name = g.get("name", "") if isinstance(g, dict) else str(g)
+                if name:
+                    monitored_names.add(name.lower())
+    except Exception:
+        pass
+
+    filtered: list[dict[str, Any]] = []
+    for c in changes:
+        game_name = c.get("game_name", "")
+        if not game_name:
+            continue
+
+        # Monitored list always passes
+        if game_name.lower() in monitored_names:
+            filtered.append(c)
+            continue
+
+        # Use full classify_game logic (brand signals, Steam ports, keywords)
+        genre = c.get("category", "")
+        if classify_game(game_name, genre=genre) == "track":
+            filtered.append(c)
+
+    return filtered
+
+
 # ── CLI ───────────────────────────────────────────────────────
 
 def _run_tests() -> int:
@@ -247,6 +309,7 @@ def _run_tests() -> int:
     # ── Track matches ──
     check("TD game", "track", game_name="暗夜防线", genre="塔防", tags=["策略", "TD"])
     check("Roguelike game", "track", game_name="地牢探险", genre="Roguelike", tags=["肉鸽", "地牢"])
+    check("Vampire Survivors", "track", game_name="割草体验", genre="割草", tags=["幸存者"])
     check("Tower Defense EN", "track", game_name="Kingdom Rush", genre="Tower Defense")
     check("Brand signal", "track", game_name="王国保卫战", genre="策略")
     check("Sub-keyword in name", "track", game_name="保卫萝卜4", genre="休闲")
@@ -261,6 +324,18 @@ def _run_tests() -> int:
     check("otome game", "ignored", game_name="恋与制作人", genre="女性向", tags=["乙女", "恋爱"])
     check("anime game", "ignored", game_name="某二次元RPG", genre="RPG", tags=["二次元"])
     check("female-oriented", "ignored", game_name="闪耀暖暖", genre="换装", tags=["女性向"])
+
+    # ── Ignored brand signals (by game name, even without ignored keywords in tags) ──
+    check("ignored brand: 恋与深空", "ignored",
+          game_name="恋与深空", genre="恋爱", description="第六男主狼人PV公布")
+    check("ignored brand: 恋与制作人 (name only)", "ignored",
+          game_name="恋与制作人")
+    check("ignored brand: 光与夜之恋", "ignored",
+          game_name="光与夜之恋", tags=["恋爱", "卡牌"])
+    check("ignored brand: 闪耀暖暖", "ignored",
+          game_name="闪耀暖暖", tags=["换装", "3D"])
+    check("ignored brand: 恋与 series prefix", "ignored",
+          game_name="恋与江湖")
 
     # ── Neutral ──
     check("MOBA game", "neutral", game_name="王者荣耀", genre="MOBA", tags=["竞技", "5v5"])

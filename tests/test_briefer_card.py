@@ -9,8 +9,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.agents.briefer import build_agent
-
 passed = 0
 failed = 0
 
@@ -29,13 +27,7 @@ def check(name: str, actual, expected, note: str = ""):
         print(f"  [FAIL] {name}: expected={repr(expected)}, got={repr(actual)}{extra}")
 
 
-# 1. Agent structure
-agent = build_agent()
-check("agent name", agent.prompt_name, "briefer")
-check("no tools", agent.tools, {})
-check("1 round", agent.max_tool_rounds, 1)
-
-# 2. DB: validate existing Briefer card
+# 1. DB: validate existing Briefer card
 from src.storage.sqlite import get_db
 db = get_db()
 report = db.get_analysis_report("2026-06-16")

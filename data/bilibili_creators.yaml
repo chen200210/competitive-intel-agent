@@ -1,0 +1,13 @@
+# Bilibili Creator Monitor — 关注列表
+#
+# 格式:
+#   - uid: "B站用户UID"
+#     label: "显示名称（用于报告）"
+#     tags: ["标签1", "标签2"]  # 可选，用于赛道匹配
+#
+# UID 获取方式: 打开UP主空间，URL中 space.bilibili.com/ 后面的数字
+
+creators:
+  - uid: "480931401"
+    label: "Enjoy出海"
+    tags: ["游戏出海", "行业资讯", "海外市场"]

@@ -12,6 +12,9 @@ business_focus:
     - "肉鸽"
     - "Roguelike"
     - "Roguelite"
+    - "割草"
+    - "幸存者like"
+    - "Vampire Survivors"
   themes: []
   validated_mechanisms:
     - "已被市场验证的塔防玩法"
@@ -39,6 +42,9 @@ track_config:
     - "肉鸽"
     - "Roguelike"
     - "Roguelite"
+    - "割草"
+    - "幸存者like"
+    - "Vampire Survivors"
   ignored_categories:
     - "女性向"
     - "二次元"
@@ -49,6 +55,12 @@ track_config:
     赛道关键词命中 → 无论是否命中可无视类别，一律关注。
     可无视类别仅在不命中赛道时生效。
     Steam移植手游不论赛道是否沾边都应调查其玩法和tag。
+  # ── 新闻打分参数（Calibrator Agent 上线后将动态写入此节点）──
+  scoring:
+    min_ai_score: 40       # AI 打分阈值，低于此分不入选
+    top_n: 7               # 最终精选条数
+    max_bilibili: 2        # 最多入选 B站 条数
+    max_per_source: 3      # 单一来源最多入选条数
 
 # === 显著性判定阈值 ===
 significance_thresholds:
@@ -62,4 +74,6 @@ significance_thresholds:
     - genre: "塔防"
       boost: 2.0
     - genre: "肉鸽"
+      boost: 2.0
+    - genre: "割草"
       boost: 2.0

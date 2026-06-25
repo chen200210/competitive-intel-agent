@@ -6,13 +6,12 @@ Zero AI token consumption. Runs after Differ, before any Agent.
 The cap is 8 (relaxed from 5). The Overview Scanner agent makes the final cut
 of 5–8 stories based on industry context and story quality.
 
-Six story types (per DESIGN.md §5.3.5 + §7.6.5):
-  1. 🔺 Big Jump          — rank up ≥ 15 positions
-  2. 🆕 Black Horse       — new entry into top 50
-  3. 📉 Cliff Drop        — rank down ≥ 20, or dropped from top 30
-  4. 📐 Cross-Chart Signal — multi-chart pattern detected (leading/traffic_leak/harvest/word_of_mouth/divergence)
-  5. 📈 Steady Climber    — 5+ consecutive days of rank improvement
-  6. 🎯 Cluster Move      — ≥3 games from same genre/developer moving together
+Five story types:
+  1. 🔺 Big Jump     — rank up ≥ 15 positions
+  2. 🆕 Black Horse  — new entry into top 50
+  3. 📉 Cliff Drop   — rank down ≥ 20, or dropped from top 30
+  4. 📈 Steady Climber — 5+ consecutive days of rank improvement
+  5. 🎯 Cluster Move — ≥3 games from same genre/developer moving together
 
 Usage:
     python -m src.pipeline.story_picker --date 2026-06-16
@@ -41,11 +40,6 @@ STORY_TYPES = {
         "label": "📉 断崖下跌",
         "priority": 90,
         "description": "排名下跌 ≥ 20 位或从前 30 掉榜",
-    },
-    "cross_chart_signal": {
-        "label": "📐 跨榜信号",
-        "priority": 85,
-        "description": "跨榜单对照检测到的异常信号（全面领跑/流量型/收割型/口碑型/背离）",
     },
     "steady_climber": {
         "label": "📈 持续爬升",
@@ -290,31 +284,15 @@ def pick_stories(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def pick_stories_for_date(date: str) -> dict[str, Any]:
-    """Full pipeline: read changes from DB, pick stories, merge cross-chart signals, return summary.
+    """Full pipeline: read changes from DB, pick stories, return summary.
 
-    Returns up to 8 candidates. The Overview Scanner agent makes the final 5–8 cut
-    based on industry context.
+    Returns up to 8 candidates.
     """
     db = get_db()
     changes = db.get_changes_by_date(date)
 
-    # 1. Single-chart stories from change records
+    # Single-chart stories from change records
     stories = pick_stories(changes) if changes else []
-
-    # 2. Cross-chart stories (multi-chart signal patterns)
-    try:
-        from src.pipeline.cross_chart import cross_chart_stories
-        cross_stories = cross_chart_stories(date)
-        if cross_stories:
-            # Merge: cross-chart stories compete with single-chart stories
-            all_candidates = stories + cross_stories
-            # Re-sort by priority
-            all_candidates.sort(key=story_priority, reverse=True)
-            # De-duplicate (cross_chart may detect the same game as a single-chart story)
-            all_candidates = deduplicate_stories(all_candidates)
-            stories = all_candidates[:MAX_STORIES]
-    except ImportError:
-        pass  # cross_chart module not available yet
 
     return {
         "date": date,

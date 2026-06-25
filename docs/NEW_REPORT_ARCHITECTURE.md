@@ -1,7 +1,7 @@
 # 竞品简报新格式 — 架构改造设计
 
 > 本文档描述现有系统为支持新简报格式需要做的架构变更。
-> 最后更新：2026-06-22
+> 最后更新：2026-06-23
 
 ---
 
@@ -93,20 +93,6 @@ track_config:
 | `steam_ports.py` | Steam 移植手游 CSV | 模式 A (ChartScraper) |
 | `news_feeds.py` | 游侠/17173 头条 CSV | 模式 A (ChartScraper) |
 
-### 2.3 点点数据按需搜索 `tools/diandian_search.py`
-
-**职责**：独立脚本，用户点击飞书卡片 "🔍 查点点数据" 按钮时触发。结果缓存 7 天。
-
-**触发链路**：
-
-```
-用户点击 "🔍 查点点数据"
-  → 飞书回调 (action callback)
-  → bot.py 解析 game_name
-  → 异步调用 diandian_search.py
-  → 飞书回复结果卡片
-```
-
 ---
 
 ## 三、修改现有模块
@@ -121,7 +107,6 @@ track_config:
 - `taptap_new_games` — TapTap 每日新游
 - `steam_port_games` — Steam 移植手游
 - `market_news` — 市场新闻
-- `diandian_search_cache` — 点点搜索缓存
 - `unreleased_games` — 未上线新游追踪
 
 ### 3.3 `src/agents/overview_scanner.py`
@@ -245,8 +230,8 @@ Phase 6: QualityAuditor（每周，有 token）🆕
 
 ### 3.7 `src/feishu/bot.py` + `card_builder.py`
 
-- **bot.py**：新增 `diandian_search` action callback 处理
-- **card_builder.py**：新增 `build_new_game_card_entry()` + `build_diandian_search_button()`
+- **bot.py**：新增 `news_feedback` / `hot_topic_click` card action 回调处理
+- **card_builder.py**：新增 `build_news_feedback_actions()` + `build_hot_topic_click_action()`
 
 ---
 
@@ -324,9 +309,7 @@ Phase 6: QualityAuditor（每周，有 token）🆕
 | 风险自审 | DesignAnalyst 产出 | **砍掉**（人来判断） |
 | 新闻展示 | 原文照搬 | **NewsCurator 策展** → 主题聚类 + 今日必读 |
 | 卡片图片 | 无 | **ImageCurator 选图上传** → 飞书卡片嵌入 |
-| 质量反馈 | 无 | **QualityAuditor 每周审计** → 红绿灯报告 |
-
-> 三个新 Agent 的完整设计见 [`docs/NEW_AGENTS_DESIGN.md`](NEW_AGENTS_DESIGN.md)
+| 质量反馈 | 无 | **audit.py 卡片零 token 审计** → 质量检查 |
 
 ---
 
@@ -345,3 +328,72 @@ Phase 6: QualityAuditor（每周，有 token）🆕
 | `src/config.py` | 配置中心不变 |
 | `tools/scrapers/base.py` | Scraper 基类不变 |
 | `tools/scrapers/diandian_batch.py` | 榜单抓取不变 |
+
+---
+
+## 七、卡片图片集成（2026-06-23 实现）
+
+### 7.1 实际方案：无 Agent，纯函数
+
+原计划用 ImageCurator Agent（Phase 3B）选图，实际砍掉了——理由同 OverviewScanner / Researcher / Verifier 的砍法：**图片的获取和上传不需要 AI 判断**。
+
+核心函数只有一个 `_build_market_elements()`，在卡片组装时调用：
+
+```
+brief()
+  └─ _build_market_elements(market_md, top_news)
+       ├─ _enrich_news_images(top_news)          → 对无图新闻调 image_fetch 抓 og:image
+       ├─ 拆分 market_md 为 标题 + N 条新闻       → 按 \n\n 分割，识别 > ** 开头
+       ├─ 逐条通过 → [原文](url) 提取链接         → 匹配 top_news 中的 image_url
+       └─ 有图: upload_image(url) → <img> 紧跟   → 无图: 跳过
+```
+
+**插入效果**：
+
+```
+📰 市场变动                          ← markdown (header)
+> **新闻1** — 来源                    ← markdown
+[封面图]                             ← img
+> **新闻2** — 来源                    ← markdown
+[配图]                               ← img
+> **新闻3** — 来源（无图）             ← markdown (无 img 跟随)
+```
+  ├─ _collect_card_image_urls() → B站封面优先，去重，上限 3 张
+  └─ upload_images_for_card() → 下载→上传飞书→img 元素嵌入卡片
+```
+
+### 7.2 图片来源
+
+| 来源 | 图片 | 获取方式 | 获取时机 |
+|------|------|----------|----------|
+| B站视频 | 封面图 (`bilibili_videos.cover`) | 库里有，`_bilibili_to_news()` 传递 | 抓取时已入库 |
+| 新闻文章 | og:image | `_enrich_news_images()` 调 `image_fetch(url)` 按需提取 | 报告生成时 |
+
+### 7.3 匹配策略
+
+`_build_market_elements()` 通过 URL 将图片关联到对应条目：
+
+1. 拆分 AI 生成的 `market_md`：按 `\n\n` 分割，以 `> **` 开头的是新闻条目
+2. 从每条 markdown 中提取 `→ [原文](url)` 中的链接
+3. 用链接查 `top_news` 中对应条目的 `image_url`
+4. 有图：调 `upload_image()` 上传飞书 → `<img>` 元素紧跟该条 markdown
+5. 无图：跳过，不插入
+
+### 7.4 涉及文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/agents/briefer.py` | `_bilibili_to_news()` + `_compact_news()` 传递 `image_url`；`_enrich_news_images()` 抓 og:image；**`_build_market_elements()` 拆分 market_md + 逐条配图** |
+| `src/feishu/pusher.py` | `upload_image()` 加 B站 Referer 防盗链；`upload_images_for_card()` 支持 `insert_after_index` + 解包 wrapper |
+| `src/pipeline/audit.py` | `split("\\n")` → `split("\n")` 修复 |
+| 数据库 | 不改，B站封面已在 `bilibili_videos.cover`，新闻图片不持久化 |
+
+### 7.5 设计决策
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 不做 ImageCurator Agent | 纯函数替代 | 图片选取规则简单（有图就用，URL 匹配），不需要 AI |
+| 图片不在抓取时提取 | 报告生成时按需取 | 新闻 40+ 条只展示 ≤7 条，抓取时全取浪费 |
+| 逐条插入而非堆顶 | `_build_market_elements` 拆分+交替 | 每条新闻配自己的图，视觉关联更强 |
+| 无图条目不占位 | 跳过 | 不插入空白占位，卡片更紧凑 |
+| 图片获取失败不阻塞 | try/except + print warning | best-effort，不影响日报主流程 |

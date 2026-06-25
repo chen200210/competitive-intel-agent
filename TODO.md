@@ -11,7 +11,7 @@
 - [x] 全链路并行优化：从 27min 降至 ~3min
 - [x] 跨榜信号优先规则 + 赛道过滤 + 图片搜索优化
 - [x] NEW_REPORT_ARCHITECTURE 第一轮：track_config + 5新表DDL + track_filter + taptap_new_games
-- [x] NEW_REPORT_ARCHITECTURE 第二轮：steam_ports + news_feeds + diandian_search
+- [x] NEW_REPORT_ARCHITECTURE 第二轮：steam_ports + news_feeds
 - [x] **第三轮：简报新格式**（全部完成）
   - [x] design_analyst 删 risk_mirror + monetization + market_viability + actionable_insight（砍到 3 维）
   - [x] overview_scanner 只盯赛道 → 纯推理 Agent（砍掉 web_search/web_fetch，零工具）
@@ -24,12 +24,6 @@
 - [x] **搜索方案**：360(主) → 搜狗 → Bing，三级降级
 - [x] **新闻来源扩展**：游侠 + 17173 + 3DM + 游戏陀螺，去除非游戏关键词 + 砍掉赛道新闻搜索
 - [x] **关注度加赛道权重**：`differ.py` 赛道游戏 +1.5 分
-
----
-
-## 进行中
-
-- [ ] **🔍 查点点数据按钮** — Bot 回调已通，`event.action.value` 取到了 game_name，chat_id 定位中（`context`/`host` 字段排查）
 
 ---
 
@@ -50,3 +44,12 @@
 - [ ] 飞书卡片排版优化
 - [ ] 给 Briefer prompt 加 few-shot 示例
 - [ ] 自评估框架
+
+## 用户反馈驱动的新闻推荐优化
+
+- [ ] **飞书回调解析** — `bot.py` 加消息路由，识别 @机器人 + "好/噪音/不错/有用" 等关键词，提取被引用消息中的新闻 URL
+- [ ] **DB 表** — 新建 `user_feedback` 表: date, url, headline, source, rating(1/-1), reason, user_id
+- [ ] **反馈记录** — bot 解析后写入 `user_feedback`，回复用户确认
+- [ ] **偏好总结 Agent** — 定期（每周/累计20条新反馈）调用 LLM 读 feedback，输出偏好摘要（偏好类型、噪音类型、来源倾向）
+- [ ] **注入打分** — 偏好摘要注入 summarizer prompt 或 `_score_news_item()`，影响最终入选
+- [ ] **效果回测** — 对比反馈前后的入选新闻变化，确认偏好生效

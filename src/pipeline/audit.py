@@ -35,12 +35,11 @@ class AuditContext:
     taptap_games: list[dict[str, Any]] = field(default_factory=list)
     steam_ports: list[dict[str, Any]] = field(default_factory=list)
     market_news: list[dict[str, Any]] = field(default_factory=list)
-    unreleased_games: list[dict[str, Any]] = field(default_factory=list)
 
     def all_urls(self) -> set[str]:
         """Collect all real URLs from input data for cross-validation."""
         urls: set[str] = set()
-        for src in [self.taptap_games, self.steam_ports, self.market_news, self.unreleased_games]:
+        for src in [self.taptap_games, self.steam_ports, self.market_news]:
             for item in src:
                 for key in ("taptap_url", "steam_url", "url", "source_url"):
                     val = item.get(key, "")
@@ -94,11 +93,9 @@ DEPRECATED_KEYWORDS = [
 ]
 
 REQUIRED_SECTIONS = [
-    "今日概况",
     "新游关注",
     "市场变动",
     "排名变动",
-    "设计洞察",
 ]
 
 
@@ -132,10 +129,7 @@ def audit_card(card: dict[str, Any], context: AuditContext) -> AuditResult:
     # ── 5. Steam port ordering ──
     _check_steam_ordering(elements, context, result)
 
-    # ── 6. Design insight attribution ──
-    _check_design_attribution(elements, result)
-
-    # ── 7. Section completeness ──
+    # ── 6. Section completeness ──
     _check_sections(elements, result)
 
     # ── 8. Card size ──
@@ -176,7 +170,7 @@ def _check_news_source(elements: list[dict], result: AuditResult) -> None:
         return
 
     content = elements[idx].get("content", "")
-    lines = content.split("\\n")
+    lines = content.split("\n")
     filtered = []
     removed = 0
 
@@ -204,7 +198,7 @@ def _check_news_content(elements: list[dict], result: AuditResult) -> None:
         return
 
     content = elements[idx].get("content", "")
-    lines = content.split("\\n")
+    lines = content.split("\n")
     filtered = []
     removed = 0
 
@@ -221,59 +215,69 @@ def _check_news_content(elements: list[dict], result: AuditResult) -> None:
 
 
 def _check_news_count(elements: list[dict], result: AuditResult) -> None:
-    """Truncate news to max 5 entries."""
+    """Truncate news to max 7 entries."""
     idx = _find_section(elements, "📰")
     if idx is None:
         return
 
     content = elements[idx].get("content", "")
     # Count news entries by "→ [原文]" markers
-    entries = content.split("\\n")
+    entries = content.split("\n")
     news_lines = [i for i, line in enumerate(entries) if "→ [原文]" in line]
 
-    if len(news_lines) > 5:
-        # Keep lines up to and including the 5th "→ [原文]" marker
-        cutoff = news_lines[4] + 1  # include the 5th link line
+    if len(news_lines) > 7:
+        # Keep lines up to and including the 7th "→ [原文]" marker
+        cutoff = news_lines[6] + 1  # include the 7th link line
         # Also keep any continuation lines after the last kept entry
         while cutoff < len(entries) and entries[cutoff].strip() and "**" not in entries[cutoff]:
             cutoff += 1
         elements[idx]["content"] = "\\n".join(entries[:cutoff])
-        removed = len(news_lines) - 5
-        result.fixes_applied.append(f"新闻板块截断 {removed} 条，保留 5 条")
+        removed = len(news_lines) - 7
+        result.fixes_applied.append(f"新闻板块截断 {removed} 条，保留 7 条")
         result.score -= removed
 
 
 def _check_new_games_track(elements: list[dict], context: AuditContext, result: AuditResult) -> None:
-    """Remove TapTap games that aren't track_relevant from new-games section."""
+    """Remove games that aren't in any known data source from new-games section.
+
+    All TapTap new games (track or not) are valid — non-track games are
+    shown as fallback when no track/steam games exist.
+    """
     idx = _find_section(elements, "🆕")
     if idx is None:
         return
 
-    track_names = context.track_game_names()
-    steam_names = {g.get("game_name", "") for g in context.steam_ports}
-    if not track_names:
+    # All valid game names: steam ports + all taptap games (track + non-track fallback)
+    valid_names: set[str] = set()
+    for g in context.steam_ports:
+        name = g.get("game_name", "")
+        if name:
+            valid_names.add(name)
+    for g in context.taptap_games:
+        name = g.get("game_name", "")
+        if name:
+            valid_names.add(name)
+
+    if not valid_names:
         return
 
     content = elements[idx].get("content", "")
-    lines = content.split("\\n")
+    lines = content.split("\n")
     filtered = []
     removed = 0
     current_game = ""
 
     for line in lines:
-        # Skip section headers (contain emoji)
         if re.search(r'[📊🆕📰🎮🔴🟡⚪]', line):
             filtered.append(line)
             continue
 
-        # Detect game name lines: **GameName**
         name_match = re.match(r'\*\*(.+?)\*\*', line)
         if name_match:
-            current_game = name_match.group(1).replace("[Steam 移植]", "").strip()
+            current_game = name_match.group(1).replace("[Steam 移植]", "").replace("[Steam]", "").strip()
 
-        # If we're in a game block and the game shouldn't be here, skip lines
-        if current_game and current_game not in track_names and current_game not in steam_names:
-            if name_match:  # only count at the start of a game block
+        if current_game and current_game not in valid_names:
+            if name_match:
                 removed += 1
             continue
 
@@ -281,7 +285,7 @@ def _check_new_games_track(elements: list[dict], context: AuditContext, result: 
 
     if removed > 0:
         elements[idx]["content"] = "\\n".join(filtered)
-        result.fixes_applied.append(f"新游板块移除 {removed} 款非赛道游戏")
+        result.fixes_applied.append(f"新游板块移除 {removed} 款非游戏数据源游戏")
         result.score -= removed * 3
 
 
@@ -296,7 +300,7 @@ def _check_steam_ordering(elements: list[dict], context: AuditContext, result: A
 
     steam_names = {g.get("game_name", "") for g in context.steam_ports}
     content = elements[idx].get("content", "")
-    lines = content.split("\\n")
+    lines = content.split("\n")
 
     # Find game blocks and check if Steam games are at the top
     game_blocks: list[list[str]] = []
@@ -334,24 +338,6 @@ def _check_steam_ordering(elements: list[dict], context: AuditContext, result: A
         elements[idx]["content"] = "\\n".join(new_lines)
         result.fixes_applied.append("Steam 移植游戏已重排到新游板块最前面")
         result.score -= 1
-
-
-def _check_design_attribution(elements: list[dict], result: AuditResult) -> None:
-    """Check that design insights reference specific game names."""
-    idx = _find_section(elements, "🎮")
-    if idx is None:
-        return
-
-    content = elements[idx].get("content", "")
-    # Count bold game-name patterns vs un-attributed insight lines
-    attributed = len(re.findall(r'\*\*(.+?)\*\*[：:]', content))
-    total_bold = len(re.findall(r'\*\*(.+?)\*\*', content))
-
-    if attributed == 0 and total_bold > 0:
-        result.warnings.append("设计洞察板块有加粗文本但未以「游戏名：」开头")
-        result.score -= 5
-    elif attributed == 0 and total_bold == 0:
-        result.warnings.append("设计洞察板块缺少游戏名标注")
 
 
 def _check_sections(elements: list[dict], result: AuditResult) -> None:
@@ -417,7 +403,9 @@ def _check_urls(result: AuditResult, context: AuditContext) -> None:
     fake_urls = []
     for url in urls_in_card:
         # Skip well-known domains that aren't in input but are safe
-        if any(d in url for d in ["taptap.cn", "gamersky.com", "17173.com", "ali213.net", "3dmgame.com", "youxituoluo.com"]):
+        if any(d in url for d in ["taptap.cn", "gamersky.com", "17173.com", "ali213.net",
+                                     "3dmgame.com", "youxituoluo.com", "bilibili.com",
+                                     "yxrb.net", "gamelook.com.cn"]):
             continue
         if url not in valid_urls and not any(url.startswith(v) for v in valid_urls):
             fake_urls.append(url)
@@ -428,32 +416,27 @@ def _check_urls(result: AuditResult, context: AuditContext) -> None:
 
 
 def _check_analysis_links(elements: list[dict], result: AuditResult) -> None:
-    """Verify that 设计洞察 and 排名变动 sections have source links.
+    """Verify that the market section has source links.
 
-    Each game mentioned in these sections should have at least one real URL.
-    Without links, claims like "玩家抱怨碎片暗改" are unverifiable.
+    Market section is now split into multiple markdown blocks (one per news item,
+    each with optional image). Checks all blocks collectively.
     """
-    for section_keyword, section_name in [("🎮", "设计洞察"), ("📊", "排名变动")]:
-        idx = _find_section(elements, section_keyword)
-        if idx is None:
+    # Collect all market-related content across blocks
+    market_contents: list[str] = []
+    for el in elements:
+        if el.get("tag") != "markdown":
             continue
+        content = el.get("content", "")
+        if "📰" in content[:30] or "→ [原文]" in content or "→ [TapTap]" in content:
+            market_contents.append(content)
 
-        content = elements[idx].get("content", "")
-        # Count URLs in this section
-        urls = re.findall(r'https?://[^\s\\")]+', content)
-        # Count game mentions (bold text that looks like game names)
-        games = re.findall(r'\*\*([^*]+?)\*\*', content)
-        # Filter out section headers and non-game bold
-        game_names = [g for g in games if len(g) >= 2 and not re.search(r'[📊🆕📰🎮🔴🟡⚪]', g)]
+    all_content = "\n".join(market_contents)
+    urls = re.findall(r'https?://[^\s\\")]+', all_content)
+    if urls:
+        return  # has links, OK
 
-        if urls:
-            continue  # has links, OK
-
-        if game_names:
-            result.warnings.append(
-                f"{section_name}板块提到 {len(game_names)} 款游戏但无任何来源链接"
-            )
-            result.score -= len(game_names) * 3
+    result.warnings.append("市场变动板块无任何来源链接")
+    result.score -= 5
 
 
 # ── CLI test ─────────────────────────────────────────────────────
@@ -468,7 +451,7 @@ if __name__ == "__main__":
         "header": {"title": {"tag": "plain_text", "content": "测试"}, "template": "blue"},
         "elements": [
             {"tag": "markdown", "content": "**📊 今日概况**\\n测试"},
-            {"tag": "markdown", "content": "**🆕 新游关注**\\n\\n**Steam游戏** [Steam 移植]\\n\\n**塔防新游** — 测试\\n下载量 1万+ | 评分 8.0 | 塔防 → [TapTap](https://www.taptap.cn/app/123)  🔍 查点点数据"},
+            {"tag": "markdown", "content": "**🆕 新游关注**\\n\\n**Steam游戏** [Steam 移植]\\n\\n**塔防新游** — 测试\\n下载量 1万+ | 评分 8.0 | 塔防 → [TapTap](https://www.taptap.cn/app/123)"},
             {"tag": "markdown", "content": "**📰 市场变动**\\n\\n**游戏新闻标题** — 游侠资讯\\n摘要\\n→ [原文](https://www.gamersky.com/news/123)"},
             {"tag": "markdown", "content": "**📊 排名变动**\\n\\n**塔防游戏** +5 | 免费榜"},
             {"tag": "markdown", "content": "**🎮 设计洞察**\\n\\n**塔防新游**：核心机制是..."},

@@ -1,15 +1,13 @@
 """
 Pipeline runner — orchestrates the full daily report flow.
 
-New flow (2026-06-22):
-  Phase 0A: Scrape (parallel) → 4 scrapers
+New flow (2026-06-23):
+  Phase 0A: Scrape (parallel) → 6 scrapers (diandian, taptap, steam_ports, news_feeds, pocketgamer_biz, bilibili)
   Phase 0B: Loader → all CSV → DB
   Phase 0C: Track Filter → tag all games
-  Phase 1:  Differ → StoryPicker → CrossChart (pure rules)
-  Phase 2B: OverviewScanner → Researcher ‖ Verifier (track games only)
-  Phase 3:  DesignAnalyst (no risk_mirror)
-  Phase 4:  Briefer (reads DB directly + all agent outputs)
-  Phase 5:  Push → Feishu card
+  Phase 1:  Differ → StoryPicker (pure rules)
+  Phase 2:  Briefer (reads DB directly, generates Feishu card)
+  Phase 3:  Card Audit + Push → Feishu
 
 Usage:
     python -m src.pipeline.runner --date 2026-06-22
@@ -31,16 +29,28 @@ from src.storage.sqlite import get_db
 
 def _run_parallel(tasks: list[tuple[str, Any, tuple, dict]], max_workers: int = 8) -> list[dict]:
     """Run tasks in parallel. Each task is (name, fn, args, kwargs)."""
+    import time as _time
     results = []
     with ThreadPoolExecutor(max_workers=min(len(tasks), max_workers)) as ex:
-        futures = {ex.submit(fn, *args, **kw): name for name, fn, args, kw in tasks}
+        futures = {}
+        for name, fn, args, kw in tasks:
+            def _timed(fn=fn, args=args, kw=kw):
+                t0 = _time.monotonic()
+                try:
+                    result = fn(*args, **kw)
+                    elapsed = _time.monotonic() - t0
+                    return {"status": "ok", "elapsed": elapsed, "result": result}
+                except Exception as e:
+                    elapsed = _time.monotonic() - t0
+                    return {"status": "error", "elapsed": elapsed, "error": str(e)}
+            futures[ex.submit(_timed)] = name
         for f in as_completed(futures):
             name = futures[f]
             try:
-                f.result()
-                results.append({"name": name, "status": "ok"})
+                r = f.result()
+                results.append({"name": name, **r})
             except Exception as e:
-                results.append({"name": name, "status": "error", "error": str(e)})
+                results.append({"name": name, "status": "error", "elapsed": 0, "error": str(e)})
     return results
 
 
@@ -48,18 +58,31 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
     """Run the full daily pipeline for a given date.
 
     Skips steps that already have results in the DB (unless force=True).
+
+    Returns a dict with keys: date, total_ms, steps, card, warnings, fatal.
+    Callers should check result['fatal'] and exit non-zero when True.
     """
     db = get_db()
     steps: list[dict[str, Any]] = []
+    pipeline_warnings: list[str] = []  # non-fatal issues collected for health summary
     t_total = _time.monotonic()
 
     def _step(name: str, fn, *args, **kwargs) -> Any:
         t0 = _time.monotonic()
-        result = fn(*args, **kwargs)
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as e:
+            ms = int((_time.monotonic() - t0) * 1000)
+            msg = f"{name} failed: {e}"
+            pipeline_warnings.append(msg)
+            steps.append({"name": name, "ms": ms, "status": "error", "error": str(e)})
+            print(f"  [FAIL]  {name} ({ms}ms) — {e}")
+            return {"error": str(e)}
         ms = int((_time.monotonic() - t0) * 1000)
         status = "ok"
         if isinstance(result, dict) and result.get("error"):
             status = "error"
+            pipeline_warnings.append(f"{name}: {result.get('error', 'unknown')}")
         elif isinstance(result, dict) and result.get("skipped"):
             status = "skipped"
         steps.append({"name": name, "ms": ms, "status": status})
@@ -82,13 +105,18 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
     else:
         if force and changes:
             with db._connect() as conn:
-                conn.execute(
-                    "DELETE FROM research_results WHERE change_id IN "
-                    "(SELECT id FROM changes WHERE date = ?)", (date,)
-                )
                 conn.execute("DELETE FROM changes WHERE date = ?", (date,))
+                # Clear news dedup records for the date so re-runs
+                # (especially --brief-only) don't accumulate stale
+                # URL blocks from previous brief() → save_seen_candidates calls.
+                conn.execute(
+                    "DELETE FROM reported_items WHERE item_type IN ('news','news_seen','news_h')"
+                    " AND reported_date = ?", (date,)
+                )
+                # Clean non-ranking data accidentally imported from scraper CSVs.
+                conn.execute("DELETE FROM rankings WHERE platform = ''")
                 conn.commit()
-            print("  [FORCE] Deleted existing changes + research for re-run")
+            print("  [FORCE] Deleted existing changes + non-ranking data")
         from src.pipeline.differ import diff_with_yesterday
         diff_result = diff_with_yesterday(date)
         changes = diff_result.get("changes", [])
@@ -103,145 +131,54 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         for s in stories[:3]:
             print(f"         [{s.get('story_type','?')}] {s.get('story_headline','?')[:60]}")
 
-    # 3. Cross Chart
-    from src.pipeline.cross_chart import analyze_cross_chart, get_signals_for_date
-    cross_result = _step("Cross Chart", analyze_cross_chart, date)
-    cross_signals = get_signals_for_date(date)
-    if verbose:
-        print(f"         signals={cross_result.get('signals_found', 0)}")
-
-    # 3b. Track Filter — filter changes to track-relevant games only
-    track_changes = _filter_track_changes(changes)
+    # 3. Track Filter — filter changes to track-relevant games only
+    from src.pipeline.track_filter import filter_track_changes
+    track_changes = filter_track_changes(changes)
     if verbose:
         print(f"         track filter: {len(changes)} changes → {len(track_changes)} track-relevant")
 
-    # Filter cross-chart signals to only track-relevant games
-    track_names = {c.get("game_name", "").lower() for c in track_changes}
-    cross_signals = [s for s in cross_signals
-                     if s.get("game_name", "").lower() in track_names]
+    # ═════════════════════════════════════════════════════════════
+    # Phase 1.5: Hot Topic Search (DDG-first via VPN, fallback to domestic engines)
+    # ═════════════════════════════════════════════════════════════
+    from src.pipeline.hot_tracker import search_hot_topics
+    hot_result = _step("Hot Topic Search", search_hot_topics, date, force=force)
+    if hot_result.get("warnings"):
+        for w in hot_result["warnings"]:
+            pipeline_warnings.append(f"Hot Topic: {w}")
+    if verbose and hot_result.get("total_found"):
+        print(f"         hot topic search: found {hot_result['total_found']} articles across"
+              f" {hot_result.get('keywords_searched', 0)} keywords")
+        if not hot_result.get("vpn_ok"):
+            print(f"         [WARN] DDG unreachable (VPN down), used fallback engines")
 
     # ═════════════════════════════════════════════════════════════
-    # Phase 2: AI Agents (track games only, no Analyst)
+    # Phase 2: Briefer (reads DB directly — all scraper + pipeline data)
     # ═════════════════════════════════════════════════════════════
-    print("\n── Phase 2: AI Agents ──")
-
-    # 4. Overview Scanner — only track-relevant changes
-    overview = db.get_daily_overview(date)
-    if overview and not force:
-        recommended = json.loads(overview.get("recommended_focus_json", "[]"))
-        _step("Overview Scanner", lambda: {"skipped": True, "hint": f"{len(recommended)} focus items"})
-    else:
-        from src.agents.overview_scanner import scan
-        overview_result = _step(
-            "Overview Scanner", scan, date, "iOS", None, track_changes, stories,
-            cross_chart_signals=cross_signals, verbose=verbose,
-        )
-        overview = overview_result
-        recommended = overview_result.get("recommended_focus", [])
-
-    # 5. Researcher — parallel for each recommended item
-    existing_research = _get_existing_research_bundle_ids(db)
-    researcher_tasks: list[tuple[str, Any, tuple, dict]] = []
-    for item in recommended:
-        bid = item.get("bundle_id", "")
-        if bid in existing_research and not force:
-            steps.append({
-                "name": f"Researcher: {item.get('game_name', bid)}",
-                "ms": 0, "status": "skipped",
-            })
-            continue
-        from src.agents.researcher import research
-        change_lookup = _find_change_by_bundle_id(changes, bid)
-        researcher_tasks.append((
-            f"Researcher: {item.get('game_name', bid)}",
-            research,
-            (change_lookup or item, item.get("reason", ""), False),
-            {},
-        ))
-        existing_research.add(bid)
-
-    if researcher_tasks:
-        print(f"\n  -> Running {len(researcher_tasks)} Researchers in parallel...")
-        t0 = _time.monotonic()
-        res = _run_parallel(researcher_tasks)
-        steps.extend(res)
-        elapsed = int((_time.monotonic() - t0) * 1000)
-        print(f"  <- Researchers done ({elapsed}ms)")
-
-    # 6. Verifier — parallel for each unverified research result
-    research_rows = db._connect().execute(
-        "SELECT id, findings_json, verified_json FROM research_results"
-    ).fetchall()
-    verifier_tasks: list[tuple[str, Any, tuple, dict]] = []
-    for row in research_rows:
-        if row["verified_json"] and not force:
-            continue
-        try:
-            findings = json.loads(row["findings_json"])
-            if "parse_error" in findings or not findings.get("findings"):
-                continue
-        except Exception:
-            continue
-        from src.agents.verifier import verify
-        verifier_tasks.append((
-            f"Verifier: {findings.get('game', '?')}", verify,
-            (findings,), {"verbose": False},
-        ))
-
-    if verifier_tasks:
-        print(f"\n  -> Running {len(verifier_tasks)} Verifiers in parallel...")
-        t0 = _time.monotonic()
-        res = _run_parallel(verifier_tasks)
-        steps.extend(res)
-        elapsed = int((_time.monotonic() - t0) * 1000)
-        print(f"  <- Verifiers done ({elapsed}ms)")
-
-    # ═════════════════════════════════════════════════════════════
-    # Phase 3: Design Analyst (no risk_mirror)
-    # ═════════════════════════════════════════════════════════════
-    print("\n── Phase 3: Design Analyst ──")
-
-    analysis = db.get_analysis_report(date)
-    design_done = bool(analysis and analysis.get("design_analysis_json") and not force)
-    for row in research_rows:
-        try:
-            findings = json.loads(row["findings_json"])
-            if "parse_error" in findings:
-                continue
-            has_design = any(
-                f.get("design_tags")
-                for f in findings.get("findings", [])
-            )
-            if has_design and not design_done:
-                from src.agents.design_analyst import analyze as design_analyze
-                _step(
-                    f"Design Analyst: {findings.get('game', '?')}",
-                    design_analyze, findings, verbose=verbose,
-                )
-                design_done = True
-            elif has_design and design_done:
-                _step("Design Analyst", lambda: {"skipped": True, "hint": "already computed"})
-                break
-        except Exception:
-            continue
-
-    # ═════════════════════════════════════════════════════════════
-    # Phase 4: Briefer (reads DB directly + all agent outputs)
-    # ═════════════════════════════════════════════════════════════
-    print("\n── Phase 4: Briefer ──")
+    print("\n── Phase 2: Briefer ──")
 
     from src.agents.briefer import brief_from_db
-    brief_result = _step("Briefer", brief_from_db, date, verbose)
+    brief_result = _step("Briefer", brief_from_db, date, verbose, warnings=pipeline_warnings)
     card = brief_result.get("card", {})
 
     # Phase 4.5: Card Audit (zero token)
     if card:
         from src.pipeline.audit import audit_card, AuditContext
+
+        # Gather bilibili video URLs for URL validation (they're merged into
+        # market_news later in brief_from_db, so audit doesn't see them by default)
+        bilibili_news: list[dict[str, Any]] = []
+        try:
+            bvideos = db.get_bilibili_videos_by_date(date)
+            if bvideos:
+                from src.agents.briefer import _bilibili_to_news
+                bilibili_news = _bilibili_to_news(bvideos)
+        except Exception:
+            pass
+
         audit_ctx = AuditContext(
             taptap_games=db.get_taptap_games_by_date(date),
             steam_ports=db.get_steam_ports_by_date(date),
-            market_news=db.get_market_news_by_date(date),
-            unreleased_games=db.get_unreleased_games_by_date(date),
+            market_news=list(db.get_market_news_by_date(date)) + bilibili_news,
         )
         audit_result = audit_card(card, audit_ctx)
         card = audit_result.fixed_card
@@ -258,17 +195,44 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
             _step("Card Audit", lambda: {"score": audit_result.score, "passed": audit_result.passed})
 
     # ═════════════════════════════════════════════════════════════
-    # Summary
+    # Summary + FATAL check
     # ═════════════════════════════════════════════════════════════
     total_ms = int((_time.monotonic() - t_total) * 1000)
     total_s = total_ms / 1000
     ai_steps = [s for s in steps if s["status"] != "skipped" and s["name"] not in
-                ("Differ", "Story Picker", "Cross Chart")]
+                ("Differ", "Story Picker")]
     skipped = sum(1 for s in steps if s["status"] == "skipped")
+    errors = sum(1 for s in steps if s["status"] == "error")
+
+    # ── FATAL classification ──
+    # Briefer produced no card → pipeline is useless, treat as fatal.
+    fatal = not card
+    if fatal:
+        pipeline_warnings.insert(0, "FATAL: Briefer produced no card — pipeline output is empty")
+
+    # ── Save pipeline_runs record for monitoring ──
+    try:
+        phases_json = json.dumps(steps, ensure_ascii=False)
+        error_summary = "; ".join(pipeline_warnings[:5]) if pipeline_warnings else ""
+        db.insert_pipeline_run(
+            date=date,
+            phases_json=phases_json,
+            exit_code=1 if fatal else 0,
+            error_summary=error_summary[:500],
+            total_ms=total_ms,
+        )
+    except Exception:
+        pass  # best-effort monitoring, never break the pipeline
 
     print(f"\n{'='*50}")
     print(f"  Pipeline complete: {total_s:.1f}s total")
-    print(f"  Steps: {len(steps)} ({skipped} skipped)")
+    print(f"  Steps: {len(steps)} ({skipped} skipped, {errors} errors)")
+    if fatal:
+        print(f"  [FATAL] Pipeline failed — no card produced")
+    if pipeline_warnings:
+        print(f"  Warnings: {len(pipeline_warnings)}")
+        for w in pipeline_warnings[:3]:
+            print(f"    - {w[:100]}")
     if ai_steps:
         ai_ms = sum(s.get("ms", 0) for s in ai_steps)
         print(f"  AI cost: {ai_ms/1000:.1f}s ({len(ai_steps)} agent calls)")
@@ -279,122 +243,111 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         "total_ms": total_ms,
         "steps": steps,
         "card": card,
+        "warnings": pipeline_warnings,
+        "fatal": fatal,
     }
-
-
-# ═════════════════════════════════════════════════════════════
-# Helpers
-# ═════════════════════════════════════════════════════════════
-
-def _filter_track_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter changes to track-relevant games.
-
-    Uses track_filter.classify_game() with available data, falling back
-    to keyword matching when genre/tags are unavailable.
-    """
-    try:
-        from src.pipeline.track_filter import classify_game
-    except ImportError:
-        return changes
-
-    filtered = []
-    for c in changes:
-        game_name = c.get("game_name", "")
-        if not game_name:
-            continue
-        # Try with whatever data we have
-        genre = c.get("category", "")
-        label = classify_game(game_name, genre=genre)
-        if label == "track":
-            filtered.append(c)
-    return filtered
-
-
-def _get_existing_research_bundle_ids(db) -> set[str]:
-    """Get bundle_ids that already have research results."""
-    ids: set[str] = set()
-    rows = db._connect().execute(
-        "SELECT findings_json FROM research_results"
-    ).fetchall()
-    for row in rows:
-        try:
-            data = json.loads(row["findings_json"])
-            bid = data.get("bundle_id", "")
-            if bid and "parse_error" not in data:
-                ids.add(bid)
-        except Exception:
-            pass
-    return ids
-
-
-def _find_change_by_bundle_id(
-    changes: list[dict[str, Any]], bundle_id: str
-) -> dict[str, Any] | None:
-    for c in changes:
-        if c.get("bundle_id") == bundle_id:
-            return c
-    return None
-
-
-def _resolve_tap_urls(track_changes: list[dict[str, Any]]) -> None:
-    """Resolve TapTap app URLs for track games missing them.
-
-    Checks taptap_new_games + kv_cache first, only runs Playwright
-    for games without cached URLs.  One-time cost per game.
-    """
-    try:
-        from src.storage.sqlite import get_db
-        db = get_db()
-
-        # Collect known URLs
-        rows = db._connect().execute(
-            "SELECT game_name, taptap_url FROM taptap_new_games WHERE taptap_url != ''"
-        ).fetchall()
-        known_urls: dict[str, str] = {r["game_name"]: r["taptap_url"] for r in rows}
-        rows2 = db._connect().execute(
-            "SELECT key, value FROM kv_cache WHERE key LIKE 'taptap_url:%'"
-        ).fetchall()
-        for r in rows2:
-            known_urls[r["key"].replace("taptap_url:", "")] = r["value"]
-
-        missing = [c.get("game_name", "") for c in track_changes
-                   if c.get("game_name", "") and c["game_name"] not in known_urls
-                   and "/app/" not in known_urls.get(c["game_name"], "")]
-
-        if not missing:
-            return
-
-        print(f"\n  Resolving TapTap URLs for {len(missing)} games...")
-        from src.tools.taptap_resolver import resolve_taptap_url
-        for i, name in enumerate(missing):
-            url = resolve_taptap_url(name)
-            status = "✅" if url else "❌"
-            print(f"    [{i+1}/{len(missing)}] {status} {name[:40]}")
-    except Exception:
-        pass  # URL resolution is optional — don't block pipeline
 
 
 # ═════════════════════════════════════════════════════════════
 # Phase 0: Scrape (CLI helper)
 # ═════════════════════════════════════════════════════════════
 
-def _run_phase0_scrape() -> None:
-    """Run all scrapers in parallel, then import all CSVs."""
+def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
+    """Run all scrapers in parallel, then import all CSVs.
+
+    Skips scrapers whose data for the target date is already in the DB.
+    Cleans up CSV files that don't match the target date after import.
+
+    Before scraping, clears today's news records so each run starts
+    with a clean slate — no stale dedup data blocking new content.
+    """
     import subprocess
 
     project_root = Path(__file__).resolve().parent.parent.parent
     scrapers_dir = project_root / "tools" / "scrapers"
+    skip_set = set(skip or [])
+
+    # ── Clean today's news data so scrapers + pipeline start fresh ──
+    db = get_db()
+    # Preserve user feedback counters across the DELETE→re-INSERT cycle.
+    # Scrapers re-insert via INSERT OR REPLACE which resets useful_count
+    # and useless_count to 0 (they are not in the INSERT column list).
+    _counter_map: dict[str, tuple[int, int]] = {}
+    try:
+        conn = db._connect()
+        rows = conn.execute(
+            "SELECT url, useful_count, useless_count FROM market_news WHERE date = ?",
+            (date,),
+        ).fetchall()
+        for r in rows:
+            uc = r["useful_count"] or 0
+            dc = r["useless_count"] or 0
+            if uc or dc:
+                _counter_map[r["url"]] = (uc, dc)
+        conn.execute("DELETE FROM market_news WHERE date = ?", (date,))
+        conn.execute(
+            "DELETE FROM reported_items WHERE item_type IN ('news','news_seen','news_h')"
+            " AND reported_date = ?", (date,)
+        )
+        conn.commit()
+        if _counter_map:
+            print(f"  [CLEAN] Saved {len(_counter_map)} feedback counters,"
+                  f" cleared today's news + dedup records for {date}")
+        else:
+            print(f"  [CLEAN] Cleared today's news + dedup records for {date}")
+    except Exception as e:
+        print(f"  [WARN] News cleanup failed: {e}")
+
+    # ── Pre-check: skip scrapers with data already in DB ──
+    scraper_db_table = {
+        "diandian_batch.py":      "rankings",
+        "taptap_new_games.py":    "taptap_new_games",
+        "steam_ports.py":         "steam_port_games",
+        "news_feeds.py":          "market_news",
+        "bilibili_creators.py":   "bilibili_videos",
+        "pocketgamer_biz.py":     "market_news",
+    }
+
+    # Per-scraper WHERE clause for shared-table pre-checks.
+    # Defaults to "date = ?" — overridden when two scrapers write the same table.
+    scraper_where: dict[str, str] = {
+        "news_feeds.py":        "date = ? AND source != 'pocketgamer.biz'",
+        "pocketgamer_biz.py":   "date = ? AND source = 'pocketgamer.biz'",
+    }
 
     scraper_scripts = [
         ("diandian_batch.py", ["--platform", "ios"]),
         ("taptap_new_games.py", []),
         ("steam_ports.py", []),
         ("news_feeds.py", []),
+        ("pocketgamer_biz.py", []),
+        ("bilibili_creators.py", ["--headless"]),
     ]
+
+    # Filter out skipped + already-have-data scrapers
+    active_scripts: list[tuple[str, list[str]]] = []
+    for script, extra_args in scraper_scripts:
+        name = script.replace(".py", "")
+        if name in skip_set or script in skip_set:
+            print(f"  [SKIP] {script} — user-requested skip")
+            continue
+        table = scraper_db_table.get(script)
+        if table:
+            where_clause = scraper_where.get(script, "date = ?")
+            sql = f"SELECT COUNT(*) as cnt FROM {table} WHERE {where_clause}"
+            row = db._connect().execute(sql, (date,)).fetchone()
+            if row and row["cnt"] > 0:
+                print(f"  [SKIP] {script} — {row['cnt']} rows for {date} already in {table}")
+                continue
+        active_scripts.append((script, extra_args))
+
+    if not active_scripts:
+        print(f"  All scrapers skipped — data already exists for {date}")
+        return
 
     print("\n── Phase 0A: Scrape (parallel) ──")
     scrape_tasks: list[tuple[str, Any, tuple, dict]] = []
-    for script, extra_args in scraper_scripts:
+    for script, extra_args in active_scripts:
         script_path = scrapers_dir / script
         if not script_path.exists():
             print(f"  [SKIP] {script} — not found")
@@ -417,9 +370,43 @@ def _run_phase0_scrape() -> None:
         for r in results:
             status = r["status"]
             tag = "[OK]" if status == "ok" else "[FAIL]"
-            print(f"  {tag:6s} {r['name']}")
+            elapsed = r.get("elapsed", 0)
+            print(f"  {tag:6s} {r['name']:<30s} ({elapsed:.0f}s)")
             if status == "error":
                 print(f"         {r.get('error', '')[:120]}")
+
+    # ── Restore feedback counters after scraper re-insert ──
+    if _counter_map:
+        db = get_db()
+        try:
+            conn = db._connect()
+            restored = 0
+            for url, (up, down) in _counter_map.items():
+                cur = conn.execute(
+                    "UPDATE market_news SET useful_count = ?, useless_count = ?"
+                    " WHERE url = ? AND date = ?",
+                    (up, down, url, date),
+                )
+                if cur.rowcount:
+                    restored += 1
+            conn.commit()
+            if restored:
+                print(f"  [RESTORE] Restored feedback counters for {restored} news items")
+        except Exception as e:
+            print(f"  [WARN] Counter restore failed: {e}")
+
+    # ── Phase 0.5: Hot Keywords ──
+    print("\n── Phase 0.5: Hot Keywords ──")
+    try:
+        from src.pipeline.hot_tracker import collect_hot_keywords
+        kw_result = collect_hot_keywords(date)
+        if kw_result.get("keywords"):
+            print(f"  [OK] Collected {kw_result['count']} hot keywords"
+                  f" from {kw_result.get('sources', [])}")
+        else:
+            print(f"  [WARN] No hot keywords collected — hot topic section will be skipped")
+    except Exception as e:
+        print(f"  [WARN] Hot keyword collection failed: {e}")
 
     # ── Phase 0B: Loader ──
     print("\n── Phase 0B: Loader ──")
@@ -440,6 +427,22 @@ def _run_phase0_scrape() -> None:
             print(f"    [WARN] {f.name}: {e}")
     print(f"  Loader: {imported} new records imported")
 
+    # ── Phase 0C: Cleanup old CSVs ──
+    # Delete CSV files that don't match the target date.
+    # Data is already in the DB, so these are just clutter.
+    deleted = 0
+    for f in sorted(raw_dir.glob("*.csv")):
+        try:
+            file_date = extract_date_from_filename(str(f))
+            if file_date != date:
+                f.unlink()
+                deleted += 1
+        except ValueError:
+            # Files without a recognizable date — keep them (might be test output)
+            pass
+    if deleted:
+        print(f"  Cleanup: removed {deleted} old CSV(s) from {raw_dir}")
+
 
 # ═════════════════════════════════════════════════════════════
 # CLI
@@ -452,29 +455,53 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(description="Run full daily pipeline")
-    parser.add_argument("--date", type=str, default=None, help="Date YYYY-MM-DD")
+    parser.add_argument("--date", type=str, default=None, help="Date YYYY-MM-DD (default: today)")
     parser.add_argument("--force", action="store_true", help="Re-run all steps")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--brief-only", action="store_true", help="Print only the final card")
     parser.add_argument("--scrape", action="store_true", help="Auto-scrape data before running")
+    parser.add_argument("--skip", type=str, default="", help="Comma-separated scrapers to skip (e.g. 'diandian_batch,news_feeds')")
     parser.add_argument("--push", type=str, default=None, metavar="CHAT_ID",
                         help="Push card to Feishu chat after completion")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run Calibrator agent (feedback-driven scoring parameter tuning)")
+    parser.add_argument("--calibrate-days", type=int, default=14,
+                        help="Days of feedback to analyze for calibration (default 14)")
     args = parser.parse_args()
-
-    # ── Phase 0: Scrape + Load (optional) ──
-    if args.scrape:
-        _run_phase0_scrape()
 
     date_arg = args.date
     if date_arg is None:
-        db = get_db()
-        dates = db.get_available_dates()
-        if not dates:
-            print("No data. Import CSV first or use --scrape.")
-            sys.exit(1)
-        date_arg = dates[0]
+        from datetime import date as dt_date
+        date_arg = dt_date.today().strftime("%Y-%m-%d")
+
+    # ── Calibrator (standalone — runs instead of pipeline) ──
+    if args.calibrate:
+        if args.scrape or args.push or args.skip:
+            print(
+                "[WARN] --calibrate runs standalone. "
+                "--scrape / --push / --skip flags are ignored.",
+                file=sys.stderr,
+            )
+        from src.agents.calibrator import run_calibrator
+        calib_result = run_calibrator(
+            days=args.calibrate_days,
+            end_date=date_arg,
+            verbose=args.verbose,
+        )
+        print(json.dumps(calib_result, ensure_ascii=False, indent=2, default=str))
+        sys.exit(0)
+
+    # ── Phase 0: Scrape + Load (optional) ──
+    if args.scrape:
+        skip_list = [s.strip() for s in args.skip.split(",") if s.strip()]
+        _run_phase0_scrape(date_arg, skip=skip_list)
 
     result = run_pipeline(date_arg, force=args.force, verbose=args.verbose)
+
+    # ── Fatal check ──
+    if result.get("fatal"):
+        print("\n[FATAL] Pipeline failed — see warnings above for details.", file=sys.stderr)
+        sys.exit(1)
 
     # ── Phase 5: Push (optional) ──
     if args.push:

@@ -21,11 +21,6 @@ from src.storage.sqlite import get_db
 # hard-coded placeholder list here for standalone testability).
 MONITORED_HIGH_PRIORITY: set[str] = set()
 
-# Genre/theme boost configuration (loaded from competitor_list.yaml at runtime)
-GENRE_BOOSTS: list[dict[str, Any]] = [
-    {"genre": "塔防", "boost": 2.0},
-    {"genre": "肉鸽", "boost": 2.0},
-]
 
 
 # ── Attention Score ──────────────────────────────────────────

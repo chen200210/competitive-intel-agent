@@ -1,7 +1,5 @@
 """
-Feishu bot — WebSocket long connection, receive @messages, intent routing.
-
-Uses lark-oapi SDK builder pattern to register event handlers.
+Feishu bot — WebSocket long connection, handles card action callbacks (feedback 👍/👎).
 
 Usage:
     python -m src.feishu.bot
@@ -18,43 +16,18 @@ import lark_oapi as lark
 from lark_oapi.ws import Client as WSClient
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 
+# ── Monkey-patch: SDK types action.value as Dict but Feishu sends JSON string ──
+from lark_oapi.event.callback.model.p2_card_action_trigger import CallBackAction as _CB_Action
+_CB_Action._types["value"] = str
+
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Intent recognition ──────────────────────────────────────────
 
-INTENT_PROMPT = """判断用户意图，返回 JSON：
-{"intent": "query_history"|"deep_research"|"compare"|"casual_chat",
- "entities": {"products": ["产品名"], "time_range": "today"|"this_week"|"last_week"|"this_month"},
- "needs_live_search": true|false,
- "search_queries": ["自动生成的搜索词"]}
-用户问题："""
-
-
-def _classify_intent(text: str) -> dict[str, Any]:
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
-    )
-    try:
-        response = client.chat.completions.create(
-            model=settings.deepseek_model,
-            messages=[
-                {"role": "system", "content": INTENT_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.1,
-            max_tokens=300,
-            response_format={"type": "json_object"},
-        )
-        return json.loads(response.choices[0].message.content or "{}")
-    except Exception:
-        return {"intent": "casual_chat", "entities": {}}
-
-
-# ── Card action handler ───────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# Card action handler — feedback buttons (👍 / 👎)
+# ═════════════════════════════════════════════════════════════
 
 def _handle_card_action(event_obj: Any) -> None:
     """Handle card.action.trigger events (button clicks on interactive cards)."""
@@ -63,7 +36,6 @@ def _handle_card_action(event_obj: Any) -> None:
 
         event = getattr(event_obj, 'event', None)
         print(f"[CARD_ACTION] event type: {type(event).__name__ if event else 'None'}")
-        print(f"[CARD_ACTION] event dir: {[a for a in dir(event) if not a.startswith('_')]}")
         action_attr = getattr(event, 'action', None)
         action_value = getattr(action_attr, 'value', None) if action_attr else None
         print(f"[CARD_ACTION] value: {repr(action_value)[:200]}")
@@ -72,27 +44,25 @@ def _handle_card_action(event_obj: Any) -> None:
             print("[CARD_ACTION] No action_value — skipping")
             return
 
-        # action_value might be dict or JSON string
+        # action_value might be dict, JSON string, or double-encoded JSON string
         if isinstance(action_value, str):
             try:
                 action_value = json.loads(action_value)
+                # Feishu sometimes double-encodes: parse again if still a string
+                if isinstance(action_value, str):
+                    action_value = json.loads(action_value)
             except Exception:
                 print(f"[CARD_ACTION] Failed to parse action_value JSON")
                 return
 
-        if isinstance(action_value, dict):
-            action = action_value.get("action", "")
-            game_name = action_value.get("game_name", "")
-        else:
+        if not isinstance(action_value, dict):
             print(f"[CARD_ACTION] Unexpected action_value type: {type(action_value)}")
             return
 
-        print(f"[CARD_ACTION] action={action}, game_name={game_name}")
+        action = action_value.get("action", "")
+        print(f"[CARD_ACTION] action={action}")
 
-        if action != "diandian_search" or not game_name:
-            return
-
-        # Extract chat_id from multiple possible locations
+        # Extract chat_id from event (common to all card actions)
         chat_id = ""
         for attr_name in ['chat_id', 'open_chat_id', 'open_id', 'user_id']:
             for obj in [event, getattr(event, 'context', None), getattr(event, 'host', None)]:
@@ -104,238 +74,168 @@ def _handle_card_action(event_obj: Any) -> None:
                             chat_id = val
 
         if not chat_id:
-            # Last resort: print all context fields
-            ctx = getattr(event, 'context', None)
-            if ctx:
-                print(f"[CARD_ACTION] context dir: {[a for a in dir(ctx) if not a.startswith('_')]}")
-            host = getattr(event, 'host', None)
-            if host:
-                print(f"[CARD_ACTION] host dir: {[a for a in dir(host) if not a.startswith('_')]}")
-            operator = getattr(event, 'operator', None)
-            if operator:
-                print(f"[CARD_ACTION] operator dir: {[a for a in dir(operator) if not a.startswith('_')]}")
-
-        print(f"[CARD_ACTION] chat_id final: {chat_id}")
-
-        if not chat_id:
+            print("[CARD_ACTION] No chat_id found — skipping")
             return
 
-        print(f"🔍 Diandian search: '{game_name}' (chat: {chat_id[:12]}...)")
+        print(f"[CARD_ACTION] chat_id={chat_id}")
 
-        # Run search in background thread to avoid blocking the bot
-        import threading
-        thread = threading.Thread(
-            target=_do_diandian_search_and_reply,
-            args=(game_name, chat_id),
-            daemon=True,
-        )
-        thread.start()
+        if action == "news_feedback":
+            fb_type = action_value.get("type", "")
+            target_date = action_value.get("target_date", "")
+            news_url = action_value.get("news_url", "")
+            # Extract user identity from event operator
+            operator = getattr(event, 'operator', None)
+            user_open_id = getattr(operator, 'open_id', '') if operator else ''
+            _handle_news_feedback(fb_type, target_date, news_url, chat_id, user_open_id)
+        elif action == "hot_topic_click":
+            news_url = action_value.get("news_url", "")
+            keyword = action_value.get("keyword", "")
+            target_date = action_value.get("target_date", "")
+            operator = getattr(event, 'operator', None)
+            user_open_id = getattr(operator, 'open_id', '') if operator else ''
+            _handle_hot_topic_click(target_date, news_url, keyword, chat_id, user_open_id)
+        else:
+            print(f"[CARD_ACTION] Unknown action: {action}")
 
     except Exception as e:
         logger.error(f"Card action processing error: {e}")
 
 
-def _do_diandian_search_and_reply(game_name: str, chat_id: str) -> None:
-    """Run diandian search in background and push result card to chat."""
-    from src.feishu.pusher import push_text, push_card
+def _handle_news_feedback(fb_type: str, target_date: str, news_url: str, chat_id: str,
+                          user_open_id: str = "") -> None:
+    """Handle per-news feedback button clicks (👍 / 👎).
 
-    # Acknowledge immediately
-    push_text(f"🔍 正在点点数据搜索「{game_name}」...", chat_id)
+    One feedback per user per news URL. Increments counter on market_news
+    and logs to user_feedback for audit trail.
+    """
+    from src.storage.sqlite import get_db
 
     try:
-        from tools.diandian_search import search_game_on_diandian
-        result = search_game_on_diandian(game_name)
+        db = get_db()
+
+        # Look up headline for the reply message
+        headline = ""
+        rows = db._connect().execute(
+            "SELECT headline FROM market_news WHERE url = ? AND date = ?",
+            (news_url, target_date),
+        ).fetchall()
+        if rows:
+            headline = rows[0]["headline"]
+            import re
+            headline = re.sub(r'^(游戏资讯|行业活动|行业分析)\s*', '', headline)
+
+        result = db.increment_news_feedback(
+            url=news_url, date=target_date,
+            feedback_type=fb_type, chat_id=chat_id,
+            open_id=user_open_id,
+        )
+
+        user_name = _get_user_name(user_open_id)
+
+        if result == "duplicate":
+            _reply_text("你已对此新闻反馈过了，感谢参与 🙏", chat_id)
+        elif result == "inserted":
+            if fb_type == "thumbs_up":
+                msg = f"感谢 {user_name} 的反馈，接下来将会推荐更多类似「{headline}」的新闻 🙏" if headline else \
+                      f"感谢 {user_name} 的反馈，接下来将会推荐更多类似新闻 🙏"
+            else:
+                msg = f"感谢 {user_name} 的反馈，接下来将会减少类似「{headline}」的新闻 🙏" if headline else \
+                      f"感谢 {user_name} 的反馈，接下来将会减少类似新闻 🙏"
+            _reply_text(msg, chat_id)
+        else:
+            _reply_text("感谢反馈！🙏", chat_id)
     except Exception as e:
-        push_text(f"❌ 点点数据搜索「{game_name}」出错：{e}", chat_id)
-        return
-
-    if not result.get("found"):
-        error_msg = result.get("error", "未找到该游戏")
-        push_text(f"❌ 点点数据「{game_name}」：{error_msg}", chat_id)
-        return
-
-    # Build result card
-    downloads = result.get("downloads") or {}
-    revenue = result.get("revenue") or {}
-    rating = result.get("rating")
-    developer = result.get("developer", "")
-    genre = result.get("genre", "")
-    bundle_id = result.get("bundle_id", "")
-    cached = result.get("cached", False)
-    source_url = result.get("source_url", "")
-
-    # Build markdown content
-    lines = [f"**🔍 点点数据：{game_name}**", ""]
-    if developer:
-        lines.append(f"开发商：{developer}")
-    if genre:
-        lines.append(f"品类：{genre}")
-    if bundle_id:
-        lines.append(f"Bundle ID：{bundle_id}")
-    lines.append("")
-    if downloads:
-        trend = downloads.get("trend", "")
-        trend_icon = {"上升": "📈", "下降": "📉", "稳定": "➡️"}.get(trend, "")
-        lines.append(f"下载量（近30天）：{trend_icon} {downloads.get('last_30d', 'N/A')}")
-    if revenue:
-        trend = revenue.get("trend", "")
-        trend_icon = {"上升": "📈", "下降": "📉", "稳定": "➡️"}.get(trend, "")
-        lines.append(f"收入（近30天）：{trend_icon} {revenue.get('last_30d', 'N/A')}")
-    if rating is not None:
-        lines.append(f"评分：{rating}")
-    if cached:
-        lines.append("")
-        lines.append("_(数据来自缓存)_")
-    if source_url:
-        lines.append(f"→ [点点数据]({source_url})")
-
-    card = {
-        "header": {
-            "title": {"tag": "plain_text", "content": f"🔍 {game_name}"},
-            "template": "blue",
-        },
-        "elements": [
-            {"tag": "markdown", "content": "\\n".join(lines)},
-        ],
-    }
-
-    push_card(card, chat_id)
+        logger.error(f"Failed to save news feedback: {e}")
+        _reply_text("感谢反馈！🙏", chat_id)
 
 
-# ── Reply ───────────────────────────────────────────────────────
+def _handle_hot_topic_click(
+    target_date: str, news_url: str, keyword: str, chat_id: str, user_open_id: str = ""
+) -> None:
+    """Handle hot topic "感兴趣" button clicks.
+
+    Records the click in user_feedback for feedback-loop keyword weight adjustment.
+    One click per user per news URL (deduped).
+    """
+    from datetime import date as _date
+    from src.storage.sqlite import get_db
+
+    try:
+        db = get_db()
+        today = _date.today().isoformat()
+        result = db.record_hot_topic_click(
+            date=today,
+            target_date=target_date,
+            news_url=news_url,
+            keyword=keyword,
+            chat_id=chat_id,
+            open_id=user_open_id,
+        )
+
+        if result == "duplicate":
+            _reply_text("你已对此热点反馈过了，感谢参与 🙏", chat_id)
+        else:
+            keyword_display = f"「{keyword}」" if keyword else ""
+            _reply_text(
+                f"已记录你对{keyword_display}相关热点的兴趣，我们会持续优化推荐 🙏",
+                chat_id,
+            )
+    except Exception as e:
+        logger.error(f"Failed to record hot topic click: {e}")
+        _reply_text("感谢反馈！🙏", chat_id)
+
+
+# ── User name cache ──────────────────────────────────────────────
+
+_name_cache: dict[str, str] = {}
+
+
+def _get_user_name(open_id: str) -> str:
+    """Look up user display name via Feishu contact API. Cached, best-effort."""
+    if not open_id:
+        return "匿名用户"
+    if open_id in _name_cache:
+        return _name_cache[open_id]
+
+    try:
+        from lark_oapi.api.contact.v3 import GetUserRequest
+        from lark_oapi.api.contact.v3.resource.user import User as UserResource
+        from lark_oapi.core.model.config import Config
+
+        conf = Config()
+        conf.app_id = settings.feishu_app_id
+        conf.app_secret = settings.feishu_app_secret
+        req = GetUserRequest.builder() \
+            .user_id_type("open_id") \
+            .user_id(open_id) \
+            .build()
+        resp = UserResource(conf).get(req)
+        if resp.success():
+            name = resp.data.user.name
+            if name:
+                _name_cache[open_id] = name
+                return name
+    except Exception:
+        pass
+
+    # Fallback: truncated open_id
+    fallback = f"用户{open_id[:6]}"
+    _name_cache[open_id] = fallback
+    return fallback
+
+
+# ── Reply helper ──────────────────────────────────────────────────
 
 def _reply_text(text: str, chat_id: str) -> None:
     from src.feishu.pusher import push_text
     push_text(text, chat_id)
 
 
-# ── Intent handlers ─────────────────────────────────────────────
-
-def _handle_query_history(entities: dict[str, Any], chat_id: str) -> None:
-    products = entities.get("products", [])
-    if not products:
-        _reply_text("请告诉我你想查哪款游戏，比如「原神上周表现怎么样」", chat_id)
-        return
-    from src.storage.sqlite import get_db
-    db = get_db()
-    lines = []
-    for product in products[:3]:
-        history = db.get_game_history(bundle_id=product, days=14)
-        if not history:
-            rows = db._connect().execute(
-                "SELECT bundle_id FROM rankings WHERE game_name LIKE ? LIMIT 1",
-                (f"%{product}%",)
-            ).fetchall()
-            if rows:
-                history = db.get_game_history(bundle_id=rows[0]["bundle_id"], days=14)
-        if history:
-            ranks = [h["rank"] for h in history[-7:]]
-            trend = "上升" if len(ranks) >= 2 and ranks[-1] < ranks[0] else \
-                    "下降" if len(ranks) >= 2 and ranks[-1] > ranks[0] else "稳定"
-            lines.append(
-                f"**{product}** 近 7 天排名: {' → '.join(str(r) for r in ranks)}\n"
-                f"趋势: {trend}，当前第 {ranks[-1]} 位"
-            )
-        else:
-            lines.append(f"**{product}**: 未找到数据")
-    _reply_text("\n\n".join(lines), chat_id)
-
-
-def _handle_deep_research(entities: dict[str, Any], chat_id: str) -> None:
-    products = entities.get("products", [])
-    queries = entities.get("search_queries", [])
-    if not products:
-        _reply_text("请告诉我你想调研哪款游戏", chat_id)
-        return
-    _reply_text(f"🔍 正在调研「{products[0]}」相关信息，可能需要 1-2 分钟...", chat_id)
-    try:
-        from src.agents.researcher import research
-        result = research(
-            change={
-                "game_name": products[0], "bundle_id": "", "developer": "",
-                "today_rank": None, "yesterday_rank": None,
-                "rank_change": None, "change_type": "manual_query",
-                "date": "", "platform": "iOS",
-            },
-            context_from_scanner=queries[0] if queries else "用户手动追问",
-        )
-        findings = result.get("findings", [])
-        if findings:
-            lines = [f"**{products[0]} 调研结果**\n"]
-            for f in findings[:5]:
-                lines.append(f"• {f.get('headline', '')}")
-                for s in f.get("sources", [])[:2]:
-                    lines.append(f"  📎 [{s.get('title', '来源')[:30]}]({s.get('url', '')})")
-            _reply_text("\n".join(lines), chat_id)
-        else:
-            _reply_text(f"调研完成但未找到关于「{products[0]}」的具体信息。", chat_id)
-    except Exception as e:
-        _reply_text(f"调研出错: {e}", chat_id)
-
-
-def _handle_compare(entities: dict[str, Any], chat_id: str) -> None:
-    products = entities.get("products", [])
-    if len(products) < 2:
-        _reply_text("请提供至少两款游戏名称，如「对比原神和鸣潮最近一周的表现」", chat_id)
-        return
-    from src.storage.sqlite import get_db
-    db = get_db()
-    lines = ["**对比分析**\n"]
-    for product in products[:3]:
-        history = db.get_game_history(bundle_id=product, days=7)
-        if history:
-            ranks = [h["rank"] for h in history]
-            lines.append(f"**{product}**: {' → '.join(str(r) for r in ranks)} (当前第{ranks[-1]}位)")
-        else:
-            rows = db._connect().execute(
-                "SELECT bundle_id FROM rankings WHERE game_name LIKE ? LIMIT 1",
-                (f"%{product}%",)
-            ).fetchall()
-            if rows:
-                history = db.get_game_history(bundle_id=rows[0]["bundle_id"], days=7)
-                ranks = [h["rank"] for h in history]
-                lines.append(f"**{product}**: {' → '.join(str(r) for r in ranks)} (当前第{ranks[-1]}位)")
-            else:
-                lines.append(f"**{product}**: 未找到数据")
-    _reply_text("\n".join(lines), chat_id)
-
-
-# ── Message processor ───────────────────────────────────────────
+# ── Message receiver (text messages are ignored; bot only handles card actions) ──
 
 def _process_message(text: str, chat_id: str) -> None:
-    """Process an incoming text message and reply."""
-    if not text or text in ("你好", "hi", "hello"):
-        _reply_text(
-            "你好！我是竞品情报助手。\n\n你可以：\n"
-            "• 📊 查历史 — **原神上周表现怎么样**\n"
-            "• 🔍 做调研 — **为什么XX今天突然冲榜**\n"
-            "• ⚖️ 做对比 — **对比原神和鸣潮**\n\n试试问我点什么？",
-            chat_id,
-        )
-        return
-
-    logger.info(f"Message: '{text[:80]}' (chat: {chat_id[:12]}...)")
-    intent_data = _classify_intent(text)
-    intent = intent_data.get("intent", "casual_chat")
-    entities = intent_data.get("entities", {})
-    logger.info(f"Intent: {intent}")
-
-    handlers = {
-        "query_history": _handle_query_history,
-        "deep_research": _handle_deep_research,
-        "compare": _handle_compare,
-    }
-    handler = handlers.get(intent)
-    if handler:
-        handler(entities, chat_id)
-    else:
-        _reply_text(
-            "我是竞品情报助手，可以帮你：\n"
-            "• 📊 查历史 — **原神上周表现怎么样**\n"
-            "• 🔍 做调研 — **为什么XX今天突然冲榜**\n"
-            "• ⚖️ 做对比 — **对比原神和鸣潮**\n\n试试问我点什么？",
-            chat_id,
-        )
+    """Text messages are ignored — bot only responds to card button clicks."""
+    pass
 
 
 # ── Event handler function ──────────────────────────────────────

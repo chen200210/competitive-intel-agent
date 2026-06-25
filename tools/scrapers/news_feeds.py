@@ -2,10 +2,11 @@
 Game News Headlines Scraper — collects daily headlines from gaming news sites.
 
 Sources:
-  1. GamerSky (游侠资讯) — https://www.gamersky.com/news/
-  2. 17173 — https://news.17173.com/
-  3. 3DM — https://www.3dmgame.com/news/
-  4. 游戏陀螺 — https://www.youxituoluo.com/
+  1. 17173 — https://news.17173.com/
+  2. 3DM — https://www.3dmgame.com/news/
+  3. 游戏陀螺 — https://www.youxituoluo.com/
+  4. 游戏日报 — https://news.yxrb.net/
+  5. GameLook — http://www.gamelook.com.cn/
 
 All items are classified through track_filter for relevance tagging.
 
@@ -18,15 +19,12 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import re
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
 from bs4 import BeautifulSoup
 
 # Fix import path for running as script or module
@@ -34,13 +32,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.pipeline.source_constants import NewsSource
+
 from tools.scrapers.base import ChartScraper
 
 # ── Config ───────────────────────────────────────────────────────
 MAX_HEADLINES_PER_SOURCE = 20    # Max headlines per news site
-MAX_TRACK_SEARCH_RESULTS = 10    # Max results from track news search
-SEARCH_DELAY = 1.5               # seconds between web_search calls
-FETCH_TIMEOUT = 20               # seconds for HTTP fetch
 
 
 class NewsFeeds(ChartScraper):
@@ -53,7 +50,7 @@ class NewsFeeds(ChartScraper):
     # Extra columns beyond base STANDARD_COLUMNS
     EXTRA_COLUMNS = [
         "headline", "source", "url", "news_category",
-        "related_game", "track_relevant",
+        "related_game", "track_relevant", "publish_date",
     ]
 
     # headline → game_name so base._clean() won't skip news rows
@@ -64,37 +61,6 @@ class NewsFeeds(ChartScraper):
         "source": "source",
     }
 
-    def __init__(self, output_dir: Path | None = None):
-        super().__init__(output_dir=output_dir)
-        self._client: httpx.Client | None = None
-
-    def _get_client(self) -> httpx.Client:
-        if self._client is None:
-            self._client = httpx.Client(
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                },
-                timeout=httpx.Timeout(FETCH_TIMEOUT),
-                follow_redirects=True,
-            )
-        return self._client
-
-    def _clean(self, raw_rows: list[dict[str, Any]], date: str) -> list[dict[str, str]]:
-        """Override to preserve extra news-specific columns."""
-        cleaned = super()._clean(raw_rows, date)
-        for raw, clean in zip(raw_rows, cleaned):
-            for col in self.EXTRA_COLUMNS:
-                val = raw.get(col, "")
-                if val is not None and val != "":
-                    clean[col] = str(val)
-        return cleaned
-
     # ── Scrape ─────────────────────────────────────────────────
 
     def scrape(self) -> list[dict[str, Any]]:
@@ -104,16 +70,7 @@ class NewsFeeds(ChartScraper):
         """
         all_news: list[dict[str, Any]] = []
 
-        # ═══ Source 1: GamerSky ═══
-        print("── 游侠资讯 (gamersky.com) ──")
-        try:
-            gamersky_news = self._scrape_gamersky()
-            print(f"  {len(gamersky_news)} 条头条")
-            all_news.extend(gamersky_news)
-        except Exception as e:
-            print(f"  [WARN] 游侠资讯抓取失败: {e}")
-
-        # ═══ Source 2: 17173 ═══
+        # ═══ Source 1: 17173 ═══
         print("── 17173 资讯 (news.17173.com) ──")
         try:
             news17173 = self._scrape_17173()
@@ -139,8 +96,24 @@ class NewsFeeds(ChartScraper):
             all_news.extend(news_tuoluo)
         except Exception as e:
             print(f"  [WARN] 游戏陀螺抓取失败: {e}")
+
+        # ═══ Source 5: 游戏日报 ═══
+        print("── 游戏日报 (news.yxrb.net) ──")
+        try:
+            news_yxrb = self._scrape_yxrb()
+            print(f"  {len(news_yxrb)} 条头条")
+            all_news.extend(news_yxrb)
         except Exception as e:
-            print(f"  [WARN] 赛道新闻搜索失败: {e}")
+            print(f"  [WARN] 游戏日报抓取失败: {e}")
+
+        # ═══ Source 6: GameLook ═══
+        print("── GameLook (gamelook.com.cn) ──")
+        try:
+            news_gamelook = self._scrape_gamelook()
+            print(f"  {len(news_gamelook)} 条头条")
+            all_news.extend(news_gamelook)
+        except Exception as e:
+            print(f"  [WARN] GameLook抓取失败: {e}")
 
         # ═══ Deduplicate by URL ═══
         seen_urls: set[str] = set()
@@ -170,63 +143,6 @@ class NewsFeeds(ChartScraper):
         print(f"  赛道相关: {track_count} 条")
 
         return unique
-
-    # ── GamerSky ──────────────────────────────────────────────
-
-    def _scrape_gamersky(self) -> list[dict[str, Any]]:
-        """Scrape GamerSky news homepage for headline list.
-
-        GamerSky uses a list layout. We try multiple common selectors
-        to handle potential HTML changes gracefully.
-        """
-        url = "https://www.gamersky.com/news/"
-        client = self._get_client()
-        resp = client.get(url)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        news: list[dict[str, Any]] = []
-        links_seen: set[str] = set()
-
-        # Strategy: find all <a> tags with href and non-empty text
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            title = a_tag.get_text(strip=True)
-
-            if not title or len(title) < 6:
-                continue
-            # Filter out navigation boilerplate
-            skip_titles = {"首页", "新闻", "资讯", "头条", "游戏", "17173首页", "游侠首页",
-                           "Home", "News", "手机版", "客户端", "APP下载"}
-            if title in skip_titles:
-                continue
-            if href in links_seen:
-                continue
-
-            # Filter: only gaming news URLs
-            if not self._is_news_url(href, domain="gamersky.com"):
-                continue
-
-            # Filter out non-gaming headlines (sports, celebrity, etc.)
-            if not self._is_gaming_headline(title):
-                continue
-
-            links_seen.add(href)
-            full_url = href if href.startswith("http") else f"https:{href}" if href.startswith("//") else f"https://www.gamersky.com{href}" if href.startswith("/") else href
-
-            news.append({
-                "rank": 0,
-                "headline": title,
-                "source": "游侠资讯",
-                "url": full_url,
-                "news_category": "头条",
-                "related_game": "",
-            })
-
-            if len(news) >= MAX_HEADLINES_PER_SOURCE:
-                break
-
-        return news
 
     # ── 17173 ─────────────────────────────────────────────────
 
@@ -265,13 +181,16 @@ class NewsFeeds(ChartScraper):
             links_seen.add(href)
             full_url = href if href.startswith("http") else f"https:{href}" if href.startswith("//") else f"https://news.17173.com{href}" if href.startswith("/") else href
 
+            publish_date = self._extract_publish_date(a_tag, full_url)
+
             news.append({
                 "rank": 0,
                 "headline": title,
-                "source": "17173",
+                "source": NewsSource.GAME_17173,
                 "url": full_url,
                 "news_category": "头条",
                 "related_game": "",
+                "publish_date": publish_date,
             })
 
             if len(news) >= MAX_HEADLINES_PER_SOURCE:
@@ -301,8 +220,8 @@ class NewsFeeds(ChartScraper):
                 continue
             if href in links_seen:
                 continue
-            # Filter: news article URLs
-            if not re.search(r'/news/\d{7,}', href):
+            # Filter: news article URLs — /news/YYYYMM/DDDDDDD.html or /news/DDDDD/
+            if not re.search(r'/news/\d{5,}', href):
                 continue
             if not self._is_gaming_headline(title):
                 continue
@@ -310,13 +229,16 @@ class NewsFeeds(ChartScraper):
             links_seen.add(href)
             full_url = href if href.startswith("http") else f"https://www.3dmgame.com{href}"
 
+            publish_date = self._extract_publish_date(a_tag, full_url)
+
             news.append({
                 "rank": 0,
                 "headline": title,
-                "source": "3DM",
+                "source": NewsSource.GAME_3DM,
                 "url": full_url,
                 "news_category": "头条",
                 "related_game": "",
+                "publish_date": publish_date,
             })
         return news
 
@@ -349,101 +271,76 @@ class NewsFeeds(ChartScraper):
             links_seen.add(href)
             full_url = f"https://www.youxituoluo.com{href}" if href.startswith("/") else href
 
+            publish_date = self._extract_publish_date(a_tag, full_url)
+
             news.append({
                 "rank": 0,
                 "headline": title,
-                "source": "游戏陀螺",
+                "source": NewsSource.GAME_TUOLUO,
                 "url": full_url,
                 "news_category": "头条",
                 "related_game": "",
+                "publish_date": publish_date,
             })
         return news
 
-    def _search_track_news_via_360(self) -> list[dict[str, Any]]:
-        """Search for track-related gaming news via 360 search.
+    # ── 游戏日报 ───────────────────────────────────────────────
 
-        Uses simple keyword queries — no site: operator (unsupported in China).
-        Results are filtered through _is_gaming_headline to remove garbage.
-        """
-        queries = [
-            "塔防 手游 新闻 2026",
-            "肉鸽 Roguelike 新游 2026",
-            "塔防 游戏 更新 2026",
-            "肉鸽 手游 新版本",
-        ]
-        all_news: list[dict[str, Any]] = []
-        seen_urls: set[str] = set()
-
-        for query in queries:
-            try:
-                result_str = web_search(query, max_results=5)
-                result = json.loads(result_str)
-            except Exception:
+    def _scrape_yxrb(self) -> list[dict[str, Any]]:
+        url = "https://news.yxrb.net/"
+        client = self._get_client()
+        resp = client.get(url)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        news: list[dict[str, Any]] = []
+        links_seen: set[str] = set()
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            title = a_tag.get_text(strip=True)
+            if not title or len(title) < 10:
                 continue
-
-            for r in result.get("results", []):
-                url = r.get("url", "")
-                title = r.get("title", "")
-                if not url or not title or url in seen_urls:
-                    continue
-                if not self._is_gaming_headline(title):
-                    continue
-                seen_urls.add(url)
-                all_news.append({
-                    "rank": 0,
-                    "headline": title,
-                    "source": "赛道新闻",
-                    "url": url,
-                    "news_category": "赛道搜索",
-                    "related_game": "",
-                })
-            time.sleep(0.3)  # anti-rate-limit
-
-        return all_news
-
-    def _search_track_news(self) -> list[dict[str, Any]]:
-        """Search for track-related gaming news via web_search.
-
-        Uses multiple queries to cover 塔防 and 肉鸽 angles.
-        """
-        queries = [
-            "塔防 手游 新闻 2026",
-            "肉鸽 手游 新闻 2026",
-        ]
-        all_items: list[dict[str, Any]] = []
-
-        for query in queries:
-            try:
-                from src.tools.web_search import web_search
-                result_str = web_search(query, max_results=5)
-                result = json.loads(result_str)
-            except Exception as e:
-                print(f"  [WARN] 搜索 '{query}' 失败: {e}")
+            if href in links_seen:
                 continue
+            if not self._is_gaming_headline(title):
+                continue
+            links_seen.add(href)
+            full_url = href if href.startswith("http") else f"https://news.yxrb.net{href}" if href.startswith("/") else href
+            publish_date = self._extract_publish_date(a_tag, full_url)
+            news.append({"rank": 0, "headline": title, "source": NewsSource.GAME_RIBAO,
+                         "url": full_url, "news_category": "头条",
+                         "related_game": "", "publish_date": publish_date})
+            if len(news) >= MAX_HEADLINES_PER_SOURCE:
+                break
+        return news
 
-            for r in result.get("results", []):
-                title = r.get("title", "")
-                url = r.get("url", "")
-                snippet = r.get("snippet", "")
+    # ── GameLook ───────────────────────────────────────────────
 
-                if not title:
-                    continue
-
-                # Try to extract a related game name from title/snippet
-                related_game = self._extract_game_name(title, snippet)
-
-                all_items.append({
-                    "rank": 0,
-                    "headline": title,
-                    "source": "赛道新闻搜索",
-                    "url": url,
-                    "news_category": "赛道",
-                    "related_game": related_game,
-                })
-
-            time.sleep(SEARCH_DELAY)
-
-        return all_items
+    def _scrape_gamelook(self) -> list[dict[str, Any]]:
+        url = "http://www.gamelook.com.cn/"
+        client = self._get_client()
+        resp = client.get(url)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        news: list[dict[str, Any]] = []
+        links_seen: set[str] = set()
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            title = a_tag.get_text(strip=True)
+            if not title or len(title) < 10:
+                continue
+            if href in links_seen:
+                continue
+            if not self._is_gaming_headline(title):
+                continue
+            links_seen.add(href)
+            full_url = href if href.startswith("http") else f"http://www.gamelook.com.cn{href}" if href.startswith("/") else href
+            publish_date = self._extract_publish_date(a_tag, full_url)
+            news.append({"rank": 0, "headline": title, "source": NewsSource.GAME_LOOK,
+                         "url": full_url, "news_category": "头条",
+                         "related_game": "", "publish_date": publish_date})
+            if len(news) >= MAX_HEADLINES_PER_SOURCE:
+                break
+        return news
 
     # ── Helpers ───────────────────────────────────────────────
 
@@ -460,6 +357,7 @@ class NewsFeeds(ChartScraper):
             "javascript:", "#", "mailto:",
             "/tag/", "/zhuanti/", "/topic/",
             "/login", "/register", "/app",
+            "club.gamersky.com",  # community forum, not news
         ]
         for pat in skip_patterns:
             if pat in url:
@@ -528,6 +426,95 @@ class NewsFeeds(ChartScraper):
         names2 = re.findall(r'「([^」]+)」', text)
         return names2[0] if names2 else ""
 
+    # ── Publish date extraction ────────────────────────────────
+
+    @staticmethod
+    def _extract_date_from_text(text: str) -> str:
+        """Try to extract a YYYY-MM-DD or similar date from a text string.
+
+        Returns 'YYYY-MM-DD' on success, empty string otherwise.
+        Only accepts dates within 2024–2027 to filter out garbage.
+        """
+        # Pattern: 2026-06-23 or 2026/06/23 or 2026.06.23
+        m = re.search(r'(20[2-9]\d)[-/.](\d{1,2})[-/.](\d{1,2})', text)
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        # Pattern: 06月23日 or 6月23日 (Chinese, assume current year)
+        m = re.search(r'(\d{1,2})月(\d{1,2})日', text)
+        if m:
+            today = datetime.now()
+            return f"{today.year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        return ""
+
+    @staticmethod
+    def _extract_date_from_url(url: str) -> str:
+        """Try to extract a date from a news article URL.
+
+        Supports patterns like:
+          - /news/202606/1234567.html   (3DM, 17173)
+          - /2026/0623/xxx.html         (full date in path)
+          - /20260623/xxx               (compact date)
+          - /2026/02/586962/            (GameLook: YYYY/MM/article_id)
+          - /2026/02/586962.html        (GameLook variant with .html)
+        """
+        # /news/202606/... → 2026-06
+        m = re.search(r'/(20[2-9]\d)(\d{2})/', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        # /2026/0623/... → 2026-06-23
+        m = re.search(r'/(20[2-9]\d)/(\d{2})(\d{2})/', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        # /2026/02/586962/ or /2026/02/586962.html → 2026-02 (GameLook pattern)
+        m = re.search(r'/(20[2-9]\d)/(\d{2})/\d{4,}(?:\.html?)?', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        # /20260623... → 2026-06-23
+        m = re.search(r'/(20[2-9]\d)(\d{2})(\d{2})\D', url)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        return ""
+
+    @classmethod
+    def _extract_publish_date(cls, a_tag, url: str) -> str:
+        """Extract publish date from an <a> tag context.
+
+        Strategy:
+          1. Look for date text in parent/sibling elements near the <a> tag.
+          2. Fall back to URL pattern extraction.
+          3. Return empty string if nothing found.
+        """
+        # Strategy 1: Look for date in parent element
+        parent = a_tag.parent
+        if parent:
+            parent_text = parent.get_text(strip=True)
+            date_str = cls._extract_date_from_text(parent_text)
+            if date_str:
+                return date_str
+
+        # Strategy 1b: Look in grandparent (common in list layouts)
+        if parent and parent.parent:
+            grandparent_text = parent.parent.get_text(strip=True)
+            date_str = cls._extract_date_from_text(grandparent_text)
+            if date_str:
+                return date_str
+
+        # Strategy 2: Look for <time> or date-classed elements nearby
+        if parent:
+            for selector in ["time", '[class*="time"]', '[class*="date"]',
+                             "span.time", "em.date", "i.date"]:
+                try:
+                    date_el = parent.select_one(selector) if hasattr(parent, 'select_one') else None
+                    if date_el:
+                        date_str = cls._extract_date_from_text(date_el.get_text(strip=True))
+                        if date_str:
+                            return date_str
+                except Exception:
+                    pass
+
+        # Strategy 3: URL pattern
+        return cls._extract_date_from_url(url)
+
     @staticmethod
     def _is_track_relevant(headline: str, related_game: str) -> bool:
         """Check if a news item is track-relevant using track_filter.
@@ -571,14 +558,16 @@ def run_scrape(date: str | None = None) -> Path | None:
 
 
 def _sync_to_db(csv_path: Path, date: str) -> None:
-    """Read scraper CSV and insert/update market_news table."""
+    """Read scraper CSV, map to record dicts, insert with cross-day dedup."""
     import csv as _csv
     try:
         from src.storage.sqlite import get_db
         db = get_db()
+
+        # ── Read CSV → standard record dicts ──
+        records: list[dict[str, Any]] = []
         with open(csv_path, encoding="utf-8-sig") as f:
             reader = _csv.DictReader(f)
-            records: list[dict[str, Any]] = []
             for row in reader:
                 headline = row.get("headline", row.get("应用", ""))
                 url = row.get("url", "")
@@ -597,10 +586,12 @@ def _sync_to_db(csv_path: Path, date: str) -> None:
                     "category": row.get("news_category", row.get("品类", "")),
                     "related_game": row.get("related_game", ""),
                     "track_relevant": track,
+                    "publish_date": row.get("publish_date", ""),
                 })
-            if records:
-                db.insert_market_news(records)
-                print(f"  📊 Synced {len(records)} news items to market_news table")
+
+        # ── Insert with cross-day URL dedup ──
+        db.insert_market_news_deduped(records, date)
+
     except Exception as e:
         print(f"  [WARN] DB sync failed: {e}")
 
@@ -630,7 +621,7 @@ if __name__ == "__main__":
             source = row.get("source", "?")
             cat = row.get("news_category", row.get("品类", ""))
             track = row.get("track_relevant", "0")
-            marker = "🔴" if track == "1" else "  "
+            marker = "[T]" if track == "1" else " - "
             print(f"  {marker} [{source}] {headline[:50]}  | {cat}")
     else:
         print("No news items collected.")

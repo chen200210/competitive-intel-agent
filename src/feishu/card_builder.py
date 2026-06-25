@@ -5,9 +5,9 @@ Used to enrich the Briefer's LLM-generated card with interactive elements
 that can't be expressed in markdown (action buttons, multi-column layouts, etc.).
 
 Usage:
-    from src.feishu.card_builder import build_diandian_search_action
+    from src.feishu.card_builder import build_news_feedback_actions
 
-    action_element = build_diandian_search_action("怪物火车2")
+    feedback_row = build_news_feedback_actions("https://...", "2026-06-24")
 """
 
 from __future__ import annotations
@@ -15,143 +15,83 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_diandian_search_action(game_name: str) -> dict[str, Any]:
-    """Build a Feishu action element with a "🔍 查点点数据" button.
+def build_news_feedback_actions(news_url: str, target_date: str) -> dict[str, Any]:
+    """Build a per-news feedback action row.
 
-    When clicked, the button sends a card.action.trigger event to the bot
-    with the game_name in the action value.
+    Two buttons: 👍 有用 / 👎 没用.
+    When clicked, sends a card.action.trigger event to the bot with the
+    news URL so the counter can be incremented on the correct market_news row.
 
     Args:
-        game_name: Name of the game to search on Diandian Data.
+        news_url: The URL of the news item (matches market_news.url).
+        target_date: The report date (YYYY-MM-DD).
 
     Returns:
         Feishu action element dict.
     """
     return {
         "tag": "action",
+        "layout": "bisected",
         "actions": [
             {
                 "tag": "button",
-                "text": {
-                    "tag": "plain_text",
-                    "content": "🔍 查点点数据",
-                },
+                "text": {"tag": "plain_text", "content": "👍 有用"},
                 "type": "default",
-                "value": json_dumps_compact({"action": "diandian_search", "game_name": game_name}),
-            }
+                "value": json_dumps_compact({
+                    "action": "news_feedback",
+                    "type": "thumbs_up",
+                    "news_url": news_url,
+                    "target_date": target_date,
+                }),
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "👎 没用"},
+                "type": "default",
+                "value": json_dumps_compact({
+                    "action": "news_feedback",
+                    "type": "thumbs_down",
+                    "news_url": news_url,
+                    "target_date": target_date,
+                }),
+            },
         ],
     }
 
 
-def build_new_game_card_entry(
-    game_name: str,
-    downloads: str = "",
-    rating: float | None = None,
-    tags: str = "",
-    taptap_url: str = "",
-    has_bundle_id: bool = False,
-) -> str:
-    """Build a markdown string for a single new game entry in the card.
-
-    Args:
-        game_name: Game display name.
-        downloads: Download count string (e.g. "10万+").
-        rating: Rating score (e.g. 8.5).
-        tags: Comma-separated or pipe-separated tag string.
-        taptap_url: TapTap page URL.
-        has_bundle_id: Whether the game has a bundle_id (enables diandian search).
-
-    Returns:
-        Markdown string for the game entry.
-    """
-    parts = [f"**{game_name}**"]
-
-    # Info line
-    info_parts = []
-    if downloads:
-        info_parts.append(f"下载量 {downloads}")
-    if rating is not None:
-        info_parts.append(f"评分 {rating}")
-    if tags:
-        info_parts.append(tags.replace("|", "、"))
-    if info_parts:
-        parts.append(" | ".join(info_parts))
-
-    # Links
-    links = []
-    if taptap_url:
-        links.append(f"→ [TapTap]({taptap_url})")
-    if has_bundle_id:
-        links.append("🔍 查点点数据")
-
-    if links:
-        parts.append(" ".join(links))
-
-    return "\\n".join(parts)
-
-
-def enrich_card_with_diandian_actions(
-    card: dict[str, Any],
-    taptap_games: list[dict[str, Any]],
+def build_hot_topic_click_action(
+    news_url: str, keyword: str, target_date: str
 ) -> dict[str, Any]:
-    """Inject diandian search buttons after the new-games section.
+    """Build a "感兴趣" click-tracking button for hot topic items.
 
-    Uses URL buttons — clicking opens diandian search in browser directly.
-    No bot callback required.
+    When clicked, sends a card.action.trigger event to the bot which records
+    the click in user_feedback for feedback-loop keyword weight adjustment.
 
     Args:
-        card: The card dict from Briefer.
-        taptap_games: TapTap new games list (from DB).
+        news_url: The URL of the hot topic news item.
+        keyword: The associated hot keyword for feedback tracking.
+        target_date: The report date (YYYY-MM-DD).
 
     Returns:
-        The enriched card dict (mutated in place).
+        Feishu action element dict.
     """
-    elements = card.get("elements", [])
-    if not elements:
-        return card
-
-    # Find games with bundle_ids AND mentioned in the card's new-games section
-    new_games_idx = None
-    new_games_content = ""
-    for i, el in enumerate(elements):
-        if el.get("tag") == "markdown" and "🆕" in el.get("content", "")[:30]:
-            new_games_idx = i
-            new_games_content = el.get("content", "")
-            break
-
-    if new_games_idx is None:
-        return card
-
-    searchable = []
-    for g in taptap_games:
-        name = g.get("game_name", "")
-        if name and g.get("bundle_id") and name in new_games_content:
-            searchable.append({"name": name, "url": f"https://app.diandian.com/search?keyword={name}"})
-
-    # Build button rows (2 per action element)
-    buttons = []
-    for s in searchable:
-        buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": f"🔍 {s['name'][:8]}"},
-            "type": "default",
-            "value": {"action": "diandian_search", "game_name": s["name"]},
-        })
-
-    # Insert action elements after the new-games section (2 buttons per row)
-    insert_idx = new_games_idx + 1
-    for i in range(0, len(buttons), 2):
-        row_buttons = buttons[i:i+2]
-        action_el = {
-            "tag": "action",
-            "layout": "bisected",
-            "actions": row_buttons,
-        }
-        elements.insert(insert_idx, action_el)
-        insert_idx += 1
-
-    card["elements"] = elements
-    return card
+    return {
+        "tag": "action",
+        "layout": "flow",
+        "actions": [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "👀 感兴趣"},
+                "type": "default",
+                "value": json_dumps_compact({
+                    "action": "hot_topic_click",
+                    "news_url": news_url,
+                    "keyword": keyword,
+                    "target_date": target_date,
+                }),
+            },
+        ],
+    }
 
 
 def json_dumps_compact(obj: dict[str, Any]) -> str:

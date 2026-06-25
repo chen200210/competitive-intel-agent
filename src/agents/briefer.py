@@ -1,13 +1,22 @@
 """
 Briefer (Agent E) — daily competitive intelligence report card.
 
-Pure reasoning agent — synthesizes all data sources (Scraper + Pipeline + Agents)
-into a Feishu interactive card JSON with the new 6-section format.
+Card assembly is done entirely in CODE.  New games, ranking, and market
+sections are all pre-built markdown — zero AI involvement, zero
+hallucination risk.
 
 Data flow:
   Scraper data → DB → briefer reads directly (no intermediate agents)
   Pipeline output → DB → briefer reads directly
-  Agent output → DB → briefer reads directly
+  AI (summarizer) scores + summarizes news → briefer assembles markdown → card JSON
+
+Orchestration only — rendering, news pipeline, AI scoring, enrichment, and
+dedup are delegated to sibling modules:
+  render.py          — markdown generation (zero AI)
+  market_pipeline.py — rule-based news filtering + diversity selection
+  scorer.py          — AI summarization + scoring (pos_label/neg_label from Matched Verdict Pool)
+  enrichment.py      — article body fetch + image collection
+  dedup.py           — reported_items read/write
 
 Usage:
     python -m src.agents.briefer --date 2026-06-22
@@ -17,136 +26,240 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid as _uuid
 from typing import Any
 
-from src.agents.base import Agent
-
-
-def build_agent(model: str | None = None) -> Agent:
-    """Create a Briefer agent (no tools — pure formatting/composition)."""
-    return Agent(
-        "briefer",
-        tools=None,
-        model=model,
-        max_tool_rounds=1,
-        max_tokens=8192,
-    )
+from src.pipeline.source_constants import NewsSource
 
 
 def brief(
     date: str,
     day_type: str = "normal",
-    overview: dict[str, Any] | None = None,
-    design_analysis: dict[str, Any] | None = None,
     taptap_games: list[dict[str, Any]] | None = None,
     steam_ports: list[dict[str, Any]] | None = None,
-    unreleased_games: list[dict[str, Any]] | None = None,
     market_news: list[dict[str, Any]] | None = None,
     sector_changes: list[dict[str, Any]] | None = None,
-    cross_chart_signals: list[dict[str, Any]] | None = None,
+    new_games_note: str = "",
     verbose: bool = False,
+    warnings: list[str] | None = None,
+    hot_topics_md: str = "",
+    hot_items: list[dict[str, Any]] | None = None,
+    yesterday_new_games: set[str] | None = None,
 ) -> dict[str, Any]:
     """Generate a Feishu card JSON for the daily report.
 
-    New 5-section format:
-      1. 📊 今日概况 — from OverviewScanner
-      2. 🆕 新游关注 — Steam移植(必展) + TapTap赛道新游 + 未上线新游
-      3. 📰 市场变动 — 游侠/17173 头条 + 赛道新闻
-      4. 📊 排名变动 — 赛道游戏排名变化 + 跨榜信号
-      5. 🎮 设计洞察 — from DesignAnalyst (no risk_mirror, no market_viability)
+    Card structure (4 sections, assembled in code — no AI hallucination):
+      1. 🆕 新游关注 — pre-built markdown (render.build_new_games_md)
+      2. 📰 市场变动 — AI-written markdown (only part that touches AI)
+      3. 📊 排名变动 — pre-built markdown (render.build_ranking_md)
+      4. 🔥 热点追踪 — pre-built markdown (render.build_hot_topics_md)
 
     Args:
         date: Date string YYYY-MM-DD.
         day_type: quiet / normal / volatile.
-        overview: Day overview from OverviewScanner.
-        design_analysis: Output from Design Analyst.
-        taptap_games: TapTap new games from DB.
+        taptap_games: TapTap new games from DB (track-relevant, already filtered).
         steam_ports: Steam port games from DB.
-        unreleased_games: Unreleased games from DB.
-        market_news: News headlines from DB.
+        market_news: News headlines from DB (includes bilibili).
         sector_changes: Track-relevant rank changes.
-        cross_chart_signals: Cross-chart signals from pipeline.
+        new_games_note: Optional note for the new games section.
         verbose: Print traces to stderr.
+        warnings: Pipeline warnings for health summary.
+        hot_topics_md: Hot topics section markdown (code-generated).
+        hot_items: Hot topic news items for per-item click tracking buttons.
 
     Returns:
         Feishu card JSON dict with msg_type and card.
     """
-
-    # ── Compact scraper data ──
-    taptap_json = json.dumps(_compact_taptap(taptap_games or []), ensure_ascii=False, indent=2)
-    steam_json = json.dumps(_compact_steam(steam_ports or []), ensure_ascii=False, indent=2)
-    unreleased_json = json.dumps(_compact_unreleased(unreleased_games or []), ensure_ascii=False, indent=2)
-    news_json = json.dumps(_compact_news(market_news or []), ensure_ascii=False, indent=2)
-
-    # ── Compact pipeline data ──
-    overview_json = json.dumps(overview or {}, ensure_ascii=False, indent=2)
-    sector_json = json.dumps(_compact_changes(sector_changes or []), ensure_ascii=False, indent=2)
-    cross_json = json.dumps(_compact_cross(cross_chart_signals or []), ensure_ascii=False, indent=2)
-
-    # ── Compact design analysis ──
-    da = design_analysis or {}
-    da_compact = {}
-    if da:
-        da_obj = da.get("design_analysis", {})
-        da_compact = {
-            "core_gameplay_breakdown": {
-                "mechanism_chain": da_obj.get("core_gameplay_breakdown", {}).get("mechanism_chain", ""),
-                "player_sentiment": da_obj.get("core_gameplay_breakdown", {}).get("player_sentiment", ""),
-            } if da_obj.get("core_gameplay_breakdown") else {},
-            "retention_transplant": da_obj.get("retention_transplant", {}),
-        }
-    design_json = json.dumps(da_compact, ensure_ascii=False, indent=2)
-
-    agent = build_agent()
-    result = agent.run(
-        date=date,
-        day_type=day_type,
-        overview_json=overview_json,
-        taptap_games_json=taptap_json,
-        steam_ports_json=steam_json,
-        unreleased_games_json=unreleased_json,
-        market_news_json=news_json,
-        sector_changes_json=sector_json,
-        cross_chart_json=cross_json,
-        design_analysis_json=design_json,
-        _verbose=verbose,
+    from src.agents.render import build_new_games_md, build_ranking_md, build_market_elements
+    from src.agents.render import build_hot_topics_md, build_hot_topic_elements
+    from src.agents.market_pipeline import filter_news, apply_fatigue, deep_fetch
+    from src.agents.scorer import ai_summarize_and_judge
+    from src.agents.dedup import (
+        save_seen_candidates, save_reported_news, headline_dedup_tokens,
     )
 
-    run_id = result.pop("_run_id", "")
+    # ── Build new games + ranking markdown in code (zero AI) ──
+    new_games_md = build_new_games_md(
+        steam_ports or [], taptap_games or [],
+        new_games_note,
+    )
+    ranking_md = build_ranking_md(sector_changes or [], yesterday_new_games=yesterday_new_games)
+
+    # ── News pipeline: hard filter → fatigue check → deep fetch → AI summarize ──
+    # Phase A: hard filters only (block kw + dedup + freshness + track ignored)
+    candidates = filter_news(market_news or [], target_date=date)
+
+    # Save ALL candidate URLs to dedup table (short TTL) so items that
+    # repeatedly appear in scraper output don't get reconsidered every day.
+    save_seen_candidates(candidates, date)
+
+    # Phase A2: fatigue check — downgrade/block topics seen in recent reports
+    candidates = apply_fatigue(candidates, date)
+
+    # Phase B: deep fetch article bodies for richer summaries
+    enriched = deep_fetch(candidates)
+
+    # Phase C+D: AI batch summarize + score + select top N (N from YAML config)
+    top_news = ai_summarize_and_judge(enriched, date=date,
+                                      day_type=day_type, verbose=verbose)
+
+    # Mark selected news URLs + headline tokens as reported for long-term dedup
+    pushed_urls = {n.get("url", "") for n in top_news if n.get("url")}
+    pushed_tokens: set[str] = set()
+    for n in top_news:
+        pushed_tokens |= headline_dedup_tokens(n.get("headline", ""))
+    if pushed_urls or pushed_tokens:
+        save_reported_news(pushed_urls, date, headline_tokens=pushed_tokens)
+
+    # ── Persist AI-annotated labels for Calibrator cross-analysis ──
+    # pos_label / neg_label are selected from the Matched Verdict Pool
+    # by the summarizer AI.  Writing them back to market_news lets the
+    # Calibrator answer "do users preferentially 👍 items labeled
+    # track_direct?" — which is the whole point of the label taxonomy.
+    if top_news:
+        try:
+            from src.storage.sqlite import get_db
+            url_labels: dict[str, tuple[str, str]] = {}
+            for n in top_news:
+                url = (n.get("url", "") or "").strip()
+                pos = (n.get("pos_label", "") or "").strip()
+                neg = (n.get("neg_label", "") or "").strip()
+                if url and (pos or neg):
+                    url_labels[url] = (pos, neg)
+            if url_labels:
+                updated = get_db().update_market_news_labels(date, url_labels)
+                if verbose:
+                    print(f"   [labels] persisted {updated} label annotations to market_news",
+                          file=sys.stderr)
+        except Exception:
+            pass  # best-effort — never block card generation on label persistence
+
+    # Phase E: code-generated market section markdown (zero AI, deterministic).
+    # The briefer LLM previously handled this, but it sometimes invented
+    # placeholder URLs (example.com, wenku.so.com) that failed audit.
+    # Since ai_summary is already written by the summarizer, the only
+    # remaining work is arranging pre-written blurbs into markdown — trivial
+    # to do in code, impossible to get wrong.
+    if top_news:
+        # Track-relevant first, then by ai_score descending
+        sorted_news = sorted(top_news, key=lambda n: (
+            not n.get("track_relevant", False),
+            -(n.get("ai_score", 0)),
+        ))
+        md_blocks: list[str] = []
+        for n in sorted_news:
+            headline = n.get("headline", "") or ""
+            source = n.get("source", "") or ""
+            summary = (n.get("ai_summary", "") or "").strip()
+            url = (n.get("url", "") or "").strip()
+            # Build the markdown block.  Omit the link line when url is
+            # genuinely empty so the card doesn't show [原文]().
+            block = f"> **{headline}** — {source}\n> {summary}"
+            if url:
+                block += f"\n> → [原文]({url})"
+            md_blocks.append(block)
+        market_md = "\n\n".join(md_blocks)
+        run_id = _uuid.uuid4().hex[:12]
+    else:
+        market_md = "> 今日无相关市场变动新闻。"
+        run_id = _uuid.uuid4().hex[:12]
+
+    # ── Assemble card JSON in code (deterministic) ──
+    elements: list[dict[str, Any]] = []
+
+    # Section 1: 新游关注
+    elements.append({
+        "tag": "markdown",
+        "content": f"**🆕 新游关注**\n{new_games_md}",
+    })
+
+    # Section 2: 市场变动 — per-item blocks with per-item images + feedback buttons
+    if not market_md.startswith("**"):
+        market_md = f"**📰 市场变动**\n\n{market_md}"
+    market_elements = build_market_elements(market_md, top_news, date=date)
+    elements.extend(market_elements)
+
+    # Section 3: 排名变动
+    elements.append({
+        "tag": "markdown",
+        "content": f"**📊 排名变动**\n{ranking_md}",
+    })
+
+    # Section 4: 热点追踪 — code-generated markdown + per-item click tracking
+    hot_topics_json_str = ""
+    if hot_topics_md and hot_items:
+        hot_elements = build_hot_topic_elements(hot_topics_md, hot_items, date=date)
+        elements.extend(hot_elements)
+        hot_topics_json_str = json.dumps(hot_items, ensure_ascii=False)
+    elif hot_topics_md:
+        elements.append({
+            "tag": "markdown",
+            "content": f"**🔥 热点追踪**\n\n{hot_topics_md}",
+        })
+
+    # Footer note
+    elements.append({
+        "tag": "note",
+        "elements": [
+            {"tag": "plain_text",
+             "content": "💡 @我 追问任何产品/在研公司/赛道方向，我会做深度调研"}
+        ],
+    })
+
+    # ── Health summary (only shown when there are warnings) ──
+    if warnings and len(warnings) > 0:
+        health_lines = ["⚠️ 系统状态"]
+        for w in warnings[:5]:
+            health_lines.append(f"  · {w[:120]}")
+        if len(warnings) > 5:
+            health_lines.append(f"  · … 及其他 {len(warnings) - 5} 条警告")
+        elements.append({
+            "tag": "markdown",
+            "content": "\n".join(health_lines),
+        })
+    elif warnings is not None:
+        # No warnings — show healthy status
+        elements.append({
+            "tag": "markdown",
+            "content": "✅ 今日全部正常",
+        })
+
+    card_data = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": f"🎮 竞品情报日报 | {date}"},
+                "template": "blue",
+            },
+            "elements": elements,
+        },
+    }
 
     # ── Persist to DB ──
     try:
         from src.storage.sqlite import get_db
         db = get_db()
-        existing = db.get_analysis_report(date)
-        if existing:
-            db.upsert_analysis_report(
-                date=date,
-                research_ids=existing.get("research_ids", "[]"),
-                report_json=existing.get("report_json", "{}"),
-                design_analysis_json=existing.get("design_analysis_json", "{}"),
-                brief_card_json=json.dumps(result, ensure_ascii=False),
-            )
-        else:
-            db.upsert_analysis_report(
-                date=date,
-                research_ids="[]",
-                report_json="{}",
-                design_analysis_json="{}",
-                brief_card_json=json.dumps(result, ensure_ascii=False),
-            )
-    except Exception:
-        pass
+        brief_json = json.dumps(card_data, ensure_ascii=False)
+        db.upsert_analysis_report(
+            date=date,
+            brief_card_json=brief_json,
+            new_games_md=new_games_md,
+            market_md=market_md,
+            ranking_md=ranking_md,
+            hot_topics_json=hot_topics_json_str,
+        )
+    except Exception as e:
+        print(f"  [WARN] Failed to save report to DB: {e}", file=sys.stderr)
 
-    result["_run_id"] = run_id
-    return result
+    card_data["_run_id"] = run_id
+    return card_data
 
 
-def brief_from_db(date: str, verbose: bool = False) -> dict[str, Any]:
+def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None = None) -> dict[str, Any]:
     """Run Briefer using all data already in the database.
 
-    Reads from: daily_overviews, analysis_reports, taptap_new_games,
-    steam_port_games, market_news, unreleased_games, changes, cross_chart_signals.
+    Reads from: taptap_new_games, steam_port_games, market_news,
+    bilibili_videos, changes.
 
     Args:
         date: Date string YYYY-MM-DD.
@@ -156,286 +269,217 @@ def brief_from_db(date: str, verbose: bool = False) -> dict[str, Any]:
         Feishu card JSON dict.
     """
     from src.storage.sqlite import get_db
+    from src.pipeline.differ import classify_day
+    from src.pipeline.track_filter import filter_track_changes
+    from src.agents.dedup import (
+        load_reported_steam, save_reported_steam,
+        load_reported_taptap, save_reported_taptap,
+    )
+    from src.agents.render import _parse_downloads, build_hot_topics_md
+
     db = get_db()
 
-    # ── Overview from OverviewScanner ──
-    overview_data = db.get_daily_overview(date)
-    day_type = "normal"
-    overview = {}
-    if overview_data:
-        day_type = overview_data.get("day_type", "normal")
-        overview = {
-            "day_type": day_type,
-            "volatility": overview_data.get("volatility", 0),
-            "recommended_focus_count": len(
-                json.loads(overview_data.get("recommended_focus_json", "[]"))
-            ),
-        }
-
-    # ── Design analysis from DesignAnalyst ──
-    analysis = db.get_analysis_report(date)
-    design_analysis = {}
-    if analysis:
-        try:
-            design_analysis = json.loads(analysis.get("design_analysis_json", "{}"))
-        except Exception:
-            pass
+    # ── Determine day type from changes ──
+    changes = db.get_changes_by_date(date)
+    if changes:
+        # total = all ranked games today (denominator for volatility),
+        # NOT len(changes) — that would make volatility always 1.0.
+        total_ranked = db._connect().execute(
+            "SELECT COUNT(*) FROM rankings WHERE date = ?", (date,)
+        ).fetchone()[0]
+        up = down = new_entry = dropped_out = big_moves = 0
+        for c in changes:
+            ct = c.get("change_type", "")
+            if ct == "up":
+                up += 1
+            elif ct == "down":
+                down += 1
+            elif ct == "new_entry":
+                new_entry += 1
+            elif ct == "dropped_out":
+                dropped_out += 1
+            if abs(c.get("rank_change") or 0) >= 15:
+                big_moves += 1
+        day_type = classify_day(
+            total=total_ranked,
+            up=up, down=down,
+            new_entry=new_entry, dropped_out=dropped_out,
+            big_moves=big_moves,
+        )
+    else:
+        day_type = "normal"
 
     # ── Scraper data (直读 DB，不经 AI) ──
-    taptap_games = db.get_taptap_games_by_date(date)
+    taptap_all = db.get_taptap_games_by_date(date)
     steam_ports = db.get_steam_ports_by_date(date)
-    unreleased = db.get_unreleased_games_by_date(date)
     market_news = db.get_market_news_by_date(date)
 
-    # ── Pipeline data ──
-    changes = db.get_changes_by_date(date)
-    sector_changes = _filter_track_changes(changes)
+    # ── Steam port dedup ──
+    reported_steam = load_reported_steam(date)
+    steam_fresh = [s for s in (steam_ports or [])
+                   if s.get("game_name", "") not in reported_steam]
 
-    # Cross-chart signals
-    cross_signals = []
-    try:
-        cross_rows = db._connect().execute(
-            "SELECT signals_json FROM cross_chart_signals WHERE date = ?",
-            (date,)
-        ).fetchall()
-        if cross_rows:
-            for row in cross_rows:
-                try:
-                    signals = json.loads(row["signals_json"])
-                    if isinstance(signals, list):
-                        cross_signals.extend(signals)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    # ── TapTap dedup + split track vs new ──
+    reported_tap = load_reported_taptap(date)
+    taptap_fresh = [g for g in taptap_all if g.get("game_name", "") not in reported_tap]
+    taptap_track = [g for g in taptap_fresh if g.get("track_relevant")]
+    taptap_other = [g for g in taptap_fresh if not g.get("track_relevant")]
+
+    # Selection logic for new games section
+    if taptap_track:
+        taptap_for_card = taptap_track
+        new_games_note = ""
+    else:
+        # No track games — fall back to popular non-track games
+        taptap_other.sort(key=lambda g: _parse_downloads(g.get("downloads", "")),
+                          reverse=True)
+        taptap_for_card = taptap_other[:5]
+        new_games_note = "今日无赛道相关新游，以下是其他新上线游戏："
+
+    # ── Mark reported (only games actually shown in the card) ──
+    shown_steam_names = {s.get("game_name", "") for s in steam_fresh}
+    shown_tap_names = {g.get("game_name", "") for g in taptap_for_card}
+    if shown_steam_names:
+        save_reported_steam(shown_steam_names, date)
+    if shown_tap_names:
+        save_reported_taptap(shown_tap_names, date)
+
+    # ── Bilibili creator videos (merge into market_news) ──
+    bilibili_videos = db.get_bilibili_videos_by_date(date)
+    if bilibili_videos:
+        bilibili_news = _bilibili_to_news(bilibili_videos)
+        market_news = list(market_news) + bilibili_news
+
+    # ── Pipeline data ──
+    sector_changes = list(filter_track_changes(changes))
+
+    # ── Yesterday's new games (for ranking table badge + force-include) ──
+    from datetime import date as dt_date, timedelta
+    yesterday_str = (dt_date.fromisoformat(date) - timedelta(days=1)).isoformat()
+    yesterday_new_games = _yesterday_shown_games(db, yesterday_str)
+
+    # Always include yesterday's new games in ranking, even if not track-relevant.
+    # Prepend them so they survive the [:12] slice in build_ranking_md() — force-
+    # included games must appear before any track-filtered entries get trimmed.
+    if yesterday_new_games:
+        from src.tools.taptap_resolver import fuzzy_match_game_name
+        existing_names = {c.get("game_name", "") for c in sector_changes}
+        extras: list[dict[str, Any]] = []
+        for c in changes:
+            name = c.get("game_name", "")
+            if name not in existing_names and fuzzy_match_game_name(name, yesterday_new_games):
+                extras.append(c)
+                existing_names.add(name)
+        sector_changes = extras + sector_changes
+
+    # ── Hot topics data ──
+    hot_items = db.get_hot_topic_news_by_date(date, selected=True, limit=7)
+    hot_keywords_rows = db.get_hot_keywords_by_date(date)
+    hot_keywords = [row.get("keyword", "") for row in hot_keywords_rows if row.get("keyword")]
+    hot_topics_md = build_hot_topics_md(hot_items, hot_keywords) if hot_items else ""
 
     return brief(
         date=date,
         day_type=day_type,
-        overview=overview,
-        design_analysis=design_analysis,
-        taptap_games=taptap_games,
-        steam_ports=steam_ports,
-        unreleased_games=unreleased,
+        taptap_games=taptap_for_card,
+        steam_ports=steam_fresh,
         market_news=market_news,
         sector_changes=sector_changes,
-        cross_chart_signals=cross_signals,
+        new_games_note=new_games_note,
         verbose=verbose,
+        warnings=warnings,
+        hot_topics_md=hot_topics_md,
+        hot_items=hot_items,
+        yesterday_new_games=yesterday_new_games,
     )
 
 
 # ═════════════════════════════════════════════════════════════
-# Compact helpers — trim scraper data to what the LLM needs
+# Yesterday's shown games — for ranking-table badge
 # ═════════════════════════════════════════════════════════════
 
-def _compact_taptap(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only track-relevant TapTap new games for display."""
-    return [
-        {
-            "game_name": g.get("game_name", ""),
-            "downloads": g.get("downloads", ""),
-            "rating": g.get("rating"),
-            "tags": g.get("tags", ""),
-            "taptap_url": g.get("taptap_url", ""),
-            "track_relevant": True,
-            "has_bundle_id": bool(g.get("bundle_id")),
-        }
-        for g in games
-        if g.get("track_relevant")  # ← only track-relevant
-    ]
+def _yesterday_shown_games(db, yesterday_str: str) -> set[str]:
+    """Return game names shown in yesterday's new-games card section.
 
+    Replicates the selection logic from brief_from_db() for a past date:
+      - TapTap: track-relevant games, or top-5 non-track by downloads
+      - Steam: all ports
 
-def _compact_steam(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep display-relevant fields for Steam port games.
-
-    Enriches with TapTap data (downloads, rating, tags) when available.
+    Does NOT replicate cross-day dedup (can't reconstruct past dedup state),
+    so this is a slight over-approximation — acceptable for the badge.
     """
-    result = []
-    for g in games:
-        entry = {
-            "game_name": g.get("game_name", ""),
-            "genre": g.get("genre", ""),
-            "gameplay_tags": g.get("gameplay_tags", ""),
-        }
-        # Try to enrich with TapTap data
-        try:
-            from src.storage.sqlite import get_db
-            db = get_db()
-            rows = db._connect().execute(
-                "SELECT downloads, rating, tags, taptap_url FROM taptap_new_games"
-                " WHERE game_name = ? AND date = (SELECT MAX(date) FROM taptap_new_games"
-                " WHERE game_name = ?)",
-                (g.get("game_name", ""), g.get("game_name", ""))
-            ).fetchall()
-            if rows:
-                r = dict(rows[0])
-                entry["downloads"] = r.get("downloads", "") or ""
-                entry["rating"] = r.get("rating")
-                entry["tags"] = r.get("tags", "") or ""
-                entry["taptap_url"] = r.get("taptap_url", "") or ""
-        except Exception:
-            pass
-        result.append(entry)
-    return result
+    from src.agents.render import _parse_downloads
+
+    shown: set[str] = set()
+
+    # TapTap selection
+    taptap_all = db.get_taptap_games_by_date(yesterday_str)
+    taptap_track = [g for g in taptap_all if g.get("track_relevant")]
+    if taptap_track:
+        shown.update(g.get("game_name", "") for g in taptap_track)
+    else:
+        taptap_other = [g for g in taptap_all if not g.get("track_relevant")]
+        taptap_other.sort(key=lambda g: _parse_downloads(g.get("downloads", "")),
+                          reverse=True)
+        shown.update(g.get("game_name", "") for g in taptap_other[:5])
+
+    # Steam ports: all are shown in the card
+    steam_all = db.get_steam_ports_by_date(yesterday_str)
+    shown.update(s.get("game_name", "") for s in (steam_all or []))
+
+    return shown
 
 
-def _compact_unreleased(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only display-relevant fields for unreleased games."""
-    return [
-        {
-            "game_name": g.get("game_name", ""),
-            "developer": g.get("developer", ""),
-            "genre": g.get("genre", ""),
-            "status": g.get("status", ""),
-            "release_date": g.get("release_date", ""),
-        }
-        for g in games
-    ]
+# ═════════════════════════════════════════════════════════════
+# Data conversion: B站 videos → news-compatible format
+# ═════════════════════════════════════════════════════════════
 
+def _bilibili_to_news(videos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert bilibili_videos rows into market_news-compatible format.
 
-def _compact_news(news: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only game-related news from 游侠/17173, max 5, track first."""
-    game_media = ["游侠", "17173", "gamersky", "ali213", "3dm", "3DM", "游戏陀螺", "youxituoluo"]
-
-    # Non-game keywords — filter out tech ads, sports, entertainment gossip
-    non_game_keywords = [
-        "AirPods", "iPhone", "iPad", "MacBook", "Apple Watch",
-        "电动滑板车", "电视", "耳机", "音箱", "手表",
-        "Prime Day", "特惠精选", "优惠", "折扣", "促销",
-        "世界杯", "足球", "NBA", "英超", "西甲", "欧冠",
-        "演唱会", "张靓颖", "明星", "八卦", "走光", "抄袭",
-        "芝麻街", "Netflix", "电影", "预告", "剧透",
-        "礼包", "广告", "赛马大会", "抢号",
-    ]
-
-    filtered = []
-    for n in news:
-        source = (n.get("source", "") or "").lower()
-        url = (n.get("url", "") or "").lower()
-
-        # Must be from game media
-        if not any(m in source or m in url for m in game_media):
-            continue
-
-        headline = n.get("headline", "")
-
-        # Skip non-game content
-        if any(kw.lower() in headline.lower() for kw in non_game_keywords):
-            continue
-
-        filtered.append(n)
-
-    # Sort: track_relevant first
-    filtered.sort(key=lambda n: (0 if n.get("track_relevant") else 1, n.get("headline", "")))
-    return [
-        {
-            "headline": n.get("headline", ""),
-            "source": n.get("source", ""),
-            "url": n.get("url", ""),
-            "track_relevant": bool(n.get("track_relevant", False)),
-        }
-        for n in filtered[:5]  # max 5
-    ]
-
-
-def _compact_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep display-relevant fields for rank changes, with TapTap URLs."""
-    # Load cached TapTap URLs
-    taptap_urls: dict[str, str] = {}
-    try:
-        from src.storage.sqlite import get_db
-        db = get_db()
-        rows = db._connect().execute(
-            "SELECT game_name, taptap_url FROM taptap_new_games WHERE taptap_url != ''"
-        ).fetchall()
-        for r in rows:
-            taptap_urls[r["game_name"]] = r["taptap_url"]
-        rows2 = db._connect().execute(
-            "SELECT key, value FROM kv_cache WHERE key LIKE 'taptap_url:%'"
-        ).fetchall()
-        for r in rows2:
-            taptap_urls[r["key"].replace("taptap_url:", "")] = r["value"]
-    except Exception:
-        pass
-
-    return [
-        {
-            "game_name": c.get("game_name", ""),
-            "change_type": c.get("change_type", ""),
-            "today_rank": c.get("today_rank"),
-            "yesterday_rank": c.get("yesterday_rank"),
-            "rank_change": c.get("rank_change"),
-            "attention_score": c.get("attention_score", 0),
-            "chart_type": c.get("chart_type", ""),
-            "taptap_url": taptap_urls.get(c.get("game_name", ""), ""),
-        }
-        for c in changes[:20]
-    ]
-
-
-def _compact_cross(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only display-relevant fields for cross-chart signals."""
-    return [
-        {
-            "game_name": s.get("game_name", ""),
-            "signal_pattern": s.get("signal_pattern", ""),
-            "signal_description": s.get("signal_description", ""),
-            "threat_level": s.get("threat_level", ""),
-            "charts_json": s.get("charts_json", {}),
-        }
-        for s in signals
-    ]
-
-
-def _filter_track_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter changes to track-relevant games using keyword matching.
-
-    Matches game names against track keywords (塔防, 肉鸽, etc.) and
-    monitored_games from competitor_list.yaml.  For more precise filtering
-    with genre/tags, use track_filter.classify_game() at the pipeline level.
+    Runs track_filter on each video title to determine relevance.
     """
-    # Base keywords
-    track_keywords: list[str] = [
-        "塔防", "TD", "tower defense", "Tower Defense",
-        "肉鸽", "Roguelike", "Roguelite",
-    ]
-
-    # Load monitored games from YAML
-    monitored_names: set[str] = set()
     try:
-        import yaml
-        from src.config import settings
-        yaml_path = settings.competitor_list_path
-        if yaml_path.exists():
-            with open(yaml_path, encoding="utf-8") as f:
-                config = yaml.safe_load(f)
-            for g in config.get("monitored_games", []):
-                name = g.get("name", "") if isinstance(g, dict) else str(g)
-                if name:
-                    monitored_names.add(name.lower())
+        from src.pipeline.track_filter import classify_game
     except Exception:
-        pass
+        classify_game = None
 
-    filtered = []
-    for c in changes:
-        game_name = c.get("game_name", "")
-        if not game_name:
-            continue
+    news_items = []
+    for v in videos:
+        label = v.get("creator_label", "")
+        title = v.get("title", "")
+        tags_str = v.get("tags", "")
+        subtitle = v.get("ai_subtitle", "")
 
-        # Check monitored list first
-        if game_name.lower() in monitored_names:
-            filtered.append(c)
-            continue
+        # Run track_filter on title + tags + subtitle
+        track = False
+        if classify_game:
+            try:
+                tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
+                result = classify_game(
+                    game_name=title,
+                    tags=tag_list if tag_list else None,
+                    description=subtitle[:500] if subtitle else "",
+                )
+                track = result == "track"
+            except Exception as e:
+                print(f"  [WARN] track_filter.classify_game failed for '{title[:40]}': {e}", file=sys.stderr)
 
-        # Check keyword match in game name
-        name_lower = game_name.lower()
-        if any(kw.lower() in name_lower for kw in track_keywords):
-            filtered.append(c)
+        headline = f"[B站·{label}] {title}"
+        news_items.append({
+            "headline": headline,
+            "source": NewsSource.BILIBILI,
+            "url": v.get("url", ""),
+            "track_relevant": track,
+            "body": subtitle,  # AI字幕全文 → summarizer用
+            "image_url": v.get("cover", ""),
+        })
+    return news_items
 
-    return filtered
 
-
-# ── CLI ─────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# CLI
+# ═════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import argparse
