@@ -44,7 +44,7 @@ OA/
 │   └── bilibili_creators.py  # B站UP主动态(Playwright+API拦截,含AI字幕/标签)
 ├── scripts/              # 独立工具脚本
 │   └── score_news.py         # 反馈加权新闻打分 (AI批量评分+同源去重)
-├── prompts/              # Agent prompts (briefer.yaml, summarizer.yaml, calibrator.yaml)
+├── prompts/              # Agent prompts (briefer.yaml, summarizer.yaml, calibrator.yaml, hot_tracker.yaml)
 ├── data/
 │   ├── raw/                  # 抓取CSV落这里
 │   ├── intel.db              # SQLite主库
@@ -61,7 +61,8 @@ Phase 0B: Loader — CSV导入 rankings表 (taptap/news/steam/bilibili各自_scr
 Phase 0C: Cleanup — 删除非当天日期的CSV文件 (数据已入库)
 Phase 0D: Track  — 赛道规则打标 (track_filter, 纯规则, 0 token)
 Phase 1:  Differ → StoryPicker (纯规则, 0 token)
-Phase 2:  Briefer (1个AI Agent: Summarizer打分+摘要+标签 → 代码拼装markdown, 0 token)
+Phase 1.5: Hot Tracker — Agent 驱动热点筛选+摘要 (系统唯一真正的 Agent, tool loop + web_fetch)
+Phase 2:  Briefer (Summarizer: Augmented LLM 打分+摘要+标签 → 代码拼装markdown, 0 token)
 Phase 3:  Card Audit + Push → 飞书 (含图片上传: B站封面优先, 新闻og:image兜底, 上限3张)
 ```
 
@@ -87,8 +88,8 @@ python -m src.pipeline.runner --date YYYY-MM-DD --scrape --skip diandian_batch
 - **卡片 JSON 由代码拼装**，AI 只写市场变动板块 markdown。新游和排名零 AI 参与，不会出现排版错乱。
 - **新游关注**: `_build_new_games_md()` 代码预制 — Steam+TapTap 合并展示，重叠游戏走 TapTap 入口+[Steam]标记
 - **排名变动**: `_build_ranking_md()` 代码预制 — 赛道上榜表格，游戏名自动关联 TapTap 链接。**昨日新游 badge**: 若游戏名匹配昨日简报展示的新游（通过 `fuzzy_match_game_name()` 三级模糊匹配），标记 `🔴【昨日新游】`。同时 `brief_from_db()` 将昨日新游**强制纳入排名表格**（prepend 到 sector_changes 头部），确保不被赛道过滤或 `[:12]` 切片丢弃。
-- **热点追踪**: `build_hot_topic_elements()` — 逐条渲染：每条热点独立 markdown block + `感兴趣` 按钮紧跟其后（与市场板块同样的 per-item interleave 模式）。上限 7 条。
-- **市场变动**: 四阶段流水线（见下），1 个 AI Agent（Summarizer 打分+摘要+标签）→ 代码直拼 markdown。`build_market_elements()` 逐条插入配图 + 👍/👎 反馈按钮。
+- **热点追踪**: Hot Tracker Agent — 系统唯一真正的 Agent（有 tool loop + web_fetch 工具）。从搜索结果中语义筛选 ≤7 条最有价值的行业热点，为每条生成 AI 摘要。渲染端 `build_hot_topic_elements()` 逐条渲染：独立 markdown block + `感兴趣` 按钮紧跟。Agent 失败时回退到搜索顺序前 7 条。上限 7 条。
+- **市场变动**: 四阶段流水线（见下）。Summarizer（Augmented LLM，单次调用无 tool）打分+摘要+标签 → 代码直拼 markdown。`build_market_elements()` 逐条插入配图 + 👍/👎 反馈按钮。
 - **共享工具**: `_split_markdown_entries()` 在 render.py — 按 `\n\n` 拆分 markdown，通过 predicate 分类 header/entry 块，供 `build_market_elements` 和 `build_hot_topic_elements` 共用。`fuzzy_match_game_name()` 在 `src/tools/taptap_resolver.py` — 三级策略（精确→基础名→双向包含），供 `_match_new_game` 和 `resolve_taptap_urls` 共用。
 - **去重**: 三种类型 — `taptap` / `steam` / `bilibili`，统一走 `reported_items` 表
 - **图片嵌入**: `_build_market_elements()` 拆分 market_md → 按 URL 匹配 top_news → 每条新闻插入对应配图（B站封面 / news og:image）+ 每条新闻末尾注入 👍/👎 反馈按钮。有图就插 `<img>` 紧跟 markdown 块，无图跳过。best-effort，失败不阻塞
@@ -96,6 +97,7 @@ python -m src.pipeline.runner --date YYYY-MM-DD --scrape --skip diandian_batch
 
 ### B站 UP 主监控 (`tools/scrapers/bilibili_creators.py`)
 - Playwright + Chrome profile，支持 headless(--headless)
+- 导航策略: `domcontentloaded`（非 networkidle，避免B站动态资源超时），60s 超时 + 自动重试 1 次
 - 获取: 标题/完整简介/AI中文字幕/标签/播放量/点赞/收藏/投币/弹幕/时长
 - 日期筛选: 今天+昨天，兜底2条最新
 - 去重: `reported_items` 表(type=bilibili)
@@ -121,8 +123,10 @@ python -m src.pipeline.runner --date YYYY-MM-DD --scrape --skip diandian_batch
 **Phase C — AI 批量摘要+打分+标签** (`scorer.ai_summarize_and_judge()`, prompt: `summarizer.yaml`):
 - 一次性批处理所有候选，生成 3-5 句摘要 + 0-100 总分 + pos_label/neg_label（Matched Verdict Pool）
 - 单总分 LLM 打分（0-100），四档锚定：80-100 赛道游戏本身 | 60-80 AI/小游戏可借鉴 | 40-60 游戏相关非赛道 | 0-40 空洞/无关
-- **代码层信号提取**（零 token）：正文长度 + 事实密度 + 时效标记 + 是否汇总 → β-fusion 融合 (`0.3×signal + 0.7×AI`)
-- **强制分布** + 重试兜底: AI 必须满足 ≥25% 低于 40 分 + ≤30% 高于 60 分，不满足自动重试（最多 3 次），全失败代码层强制修正
+- **预筛**（零 token）：`signal_score < prefilter_signal_threshold`（默认15）的候选跳过 AI，由质量门禁自动过滤。阈值通过 `competitor_list.yaml → scoring.prefilter_signal_threshold` 配置
+- **代码层信号提取**（零 token）：正文长度 + 事实密度 + 时效标记 + 是否汇总 — 一次计算存入 `_body_cache`，AI prompt 和 β-fusion 两处复用。**信号从原始正文提取**（不混入疲劳前缀"昨日话题…"）
+- **β-fusion 融合** (`0.3×signal + 0.7×AI`)
+- **强制分布** + 重试兜底: AI 必须满足 ≥25% 低于 40 分 + ≤30% 高于 60 分，不满足自动重试（最多 2 次），全失败代码层 `_apply_score_fallback()` 强制修正。**分布检查只统计 AI 实际评分的候选**，预筛候选不充数
 - **Calibrator 集成**: topic_boosts 用户偏好调节 → 分布检查（最终防线）
 - 质量门禁: `min_ai_score`（默认40）以下不入选；按分取 `top_n` 条（默认7），受来源多样性约束
 - **标签持久化**: pos_label/neg_label 写回 `market_news` 表供 Calibrator 做 `label × feedback` 交叉分析
@@ -143,8 +147,9 @@ python -m src.pipeline.runner --date YYYY-MM-DD --scrape --skip diandian_batch
 
 ### 去重 (`reported_items` 表)
 - 统一 DB 表，`UNIQUE(item_key, item_type)`
-- `item_type`: `taptap`(游戏名) / `steam`(游戏名) / `bilibili`(BVID) / `news`(URL) / `news_h`(标题令牌)
+- `item_type`: `taptap`(游戏名) / `steam`(游戏名) / `bilibili`(BVID) / `news`(已发布URL, 30天TTL) / `news_h`(已发布标题令牌, 30天TTL)
 - `INSERT OR IGNORE`，30天自动清理(`prune_reported()`)
+- **跨天去重策略 (2026-06-26 修订)**: 仅已上简报的 top-N 条目写入 `news`/`news_h` 做跨天拦截。未入选候选**不**做跨天封杀——次日与当天新候选一起重新评分。跨天话题重复由 `apply_fatigue()`（3天窗口）控制
 - 新游板块：taptap 和 steam 各自独立去重，重叠游戏合并显示不重复
 
 ## 数据库核心表
@@ -163,11 +168,33 @@ python -m src.pipeline.runner --date YYYY-MM-DD --scrape --skip diandian_batch
 | calibration_params | Calibrator校准参数(版本化,topic_boosts+dim_weights) | version |
 | audit_logs | Agent工具调用审计 | — |
 
-## 当前进度 (2026-06-25)
+## 当前进度 (2026-06-26)
 
-**已完成**: Differ, StoryPicker, Briefer, Loader, Runner, 飞书推送, track_filter, Card Audit, 用户反馈
+**已完成**: Differ, StoryPicker, Briefer, Loader, Runner, 飞书推送, track_filter, Card Audit, 用户反馈, **Hot Tracker Agent**（系统第一个真正 Agent）
 
-**最新升级 (2026-06-25) #8 — 昨日新游badge + 热点逐条渲染 + 代码清理**:
+**最新升级 (2026-06-26) #11 — Hot Tracker Agent: 系统第一个真正的 Agent**:
+- **Hot Tracker Agent** (`src/pipeline/hot_tracker.py` + `prompts/hot_tracker.yaml`): 用 AI 语义判断替代旧的"搜索顺序前 7 条"热点选择。Agent 带 `web_fetch` 工具和 tool loop（`max_tool_rounds=4`），对搜索摘要不足的候选主动抓取正文再判断。输出 ≤7 条精选热点 + AI 摘要 + 0-100 价值评分。失败时回退到旧逻辑，不阻塞管道
+- **base.py tool loop 首次被用到**: `Agent("hot_tracker", tools=[web_fetch_tool], max_tool_rounds=4)` — 之前所有 Agent 调用都是 `tools=None, max_tool_rounds=1`（Augmented LLM），这是第一个真正用到 tool-use loop 的 Agent
+- **DB 新增字段**: `hot_topic_news.ai_summary` + `hot_topic_news.value_score`（migration v12），Agent 产出的摘要和评分持久化到 DB
+- **render.py 感知 Agent**: `build_hot_topics_md()` 优先使用 `ai_summary` 字段（存在时带 🤖 标记），回退到原始 `snippet`
+- **术语修正**: 代码注释、CLAUDE.md 全文区分 Agent（有 tool loop）和 Augmented LLM（单次调用无 tool）。Summarizer 和 Calibrator 从此称为 Augmented LLM
+
+**历史升级 (2026-06-26) #10 — Code Review 修复: 预筛污染+去重策略+B站超时**:
+- **预筛零分污染 (CRITICAL)**: 修复 `ai_summarize_and_judge()` 中预筛候选（signal<15）的零分充数分布检查的问题。分布检查现在只统计 AI 实际评分的候选；`all_items` 跳过预筛项；`_apply_score_fallback` 使用正确计数；AI 失败回退排除预筛项
+- **疲劳前缀污染 (HIGH)**: `_extract_body_signals()` 现在从**原始正文**提取信号，不再混入 `_fmt_body()` 的"昨日话题…"疲劳前缀。消除疲劳降权候选人为 +10 signal_score 的 bug
+- **分布重试恢复 (HIGH)**: `_MAX_DIST_RETRIES` 从 1 恢复为 2——`retry_context` 不再是死代码，AI 有一次自我纠正机会；单次 API 故障不再直接跳到完整失败
+- **缓存复用**: `_body_cache` 一次计算三处复用（预筛+AI prompt+β-fusion），消除每候选 ~54 次字符串/正则操作的冗余扫描
+- **去重策略修正 (P0)**: 删除 `news_seen` 类型——之前把所有候选 URL（含未入选的 30+）写入 `reported_items` 做 7 天跨天封杀，导致次日候选池从 40+ 暴跌到 9。现在只对已上简报的 top-N 做 `news`（30天TTL）拦截，未入选候选次日重新评分
+- **预筛阈值 YAML 化**: `prefilter_signal_threshold` 从硬编码改为 `competitor_list.yaml → scoring` 配置，与 `min_ai_score`/`top_n`/`max_per_source` 同级
+- **B站 scraper 间歇超时**: 导航策略 `networkidle`→`domcontentloaded`，超时 30s→60s，加重试。Runner 新增 subprocess 返回码检查（之前 exit code 1 被静默标记为 OK）
+- **死代码清理**: 删除 `_orig_idx` 字段（set but never read）、`save_seen_candidates()` 函数、`news_seen` 清理代码
+
+**历史升级 (2026-06-26) #9 — AI 冗余削减**:
+- 移除 AI 重复检测（55 行代码）、`duplicates` 字段、summarizer prompt 中重复检测段落。跨语言去重由 `_is_same_story()` 接管
+- 移除 Briefer LLM 排版调用（纯字符串拼接）
+- 新增文档: `docs/RECGPT_APPLICATION.md`（RecGPT 模式应用指南）
+
+**历史升级 (2026-06-25) #8 — 昨日新游badge + 热点逐条渲染 + 代码清理**:
 - **昨日新游 badge (P0)**: 排名变动表格新增 `🔴【昨日新游】` 标记。`_yesterday_shown_games()` 复现昨日简报筛选逻辑（track-relevant 或 top-5 下载量），`fuzzy_match_game_name()` 三级模糊匹配（精确→基础名→双向包含）。`brief_from_db()` 将昨日新游 prepend 到 sector_changes 头部，确保不被 `[:12]` 切片丢弃。
 - **热点逐条渲染**: `build_hot_topic_elements()` 改为 per-item interleave 模式（markdown block + `感兴趣` 按钮紧跟），与市场板块一致的渲染模式。
 - **共享工具提取**: `fuzzy_match_game_name()` 从 `_match_new_game` 提取到 `src/tools/taptap_resolver.py`，消除与 `resolve_taptap_urls` 的重复匹配逻辑。`_split_markdown_entries()` 提取为 `render.py` 模块级函数，供 `build_market_elements` 和 `build_hot_topic_elements` 共用。

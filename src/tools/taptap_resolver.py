@@ -46,7 +46,8 @@ def resolve_taptap_url(game_name: str, force: bool = False) -> str | None:
             ).fetchall()
             if rows and rows[0][0] and "/app/" in rows[0][0]:
                 return rows[0][0]
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] DB cache lookup failed for {game_name}: {e}", file=sys.stderr)
             pass
 
     # ── Live search via Playwright ──
@@ -80,7 +81,8 @@ def resolve_taptap_url(game_name: str, force: bool = False) -> str | None:
                 match = re.search(r'/app/(\d+)', page.url)
                 if match:
                     app_id = match.group(1)
-            except Exception:
+            except Exception as e:
+                print(f"  [WARN] Playwright click/app_id extract failed for {game_name}: {e}", file=sys.stderr)
                 pass
 
             context.close()
@@ -96,13 +98,15 @@ def resolve_taptap_url(game_name: str, force: bool = False) -> str | None:
                         (f"taptap_url:{game_name}", app_url),
                     )
                     db._connect().commit()
-                except Exception:
+                except Exception as e:
+                    print(f"  [WARN] DB cache write failed for {game_name}: {e}", file=sys.stderr)
                     pass
                 return app_url
 
             return None
 
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Playwright search failed for {game_name}: {e}", file=sys.stderr)
         return None
 
 
@@ -234,7 +238,8 @@ def resolve_taptap_urls(game_names: list[str]) -> dict[str, str]:
                         urls[rank_name] = kv_name_to_url[known_name]
                     break
 
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] resolve_taptap_urls DB lookup failed: {e}", file=sys.stderr)
         pass
 
     return urls

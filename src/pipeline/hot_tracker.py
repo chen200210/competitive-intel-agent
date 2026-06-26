@@ -18,11 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from datetime import date as _date
 from typing import Any
 
 import httpx
 from bs4 import BeautifulSoup
+from pydantic import BaseModel
 
 from src.storage.sqlite import get_db
 
@@ -130,8 +132,8 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
     click_stats: dict[str, int] = {}
     try:
         click_stats = db.get_hot_keyword_click_stats(days=14)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [WARN] get_hot_keyword_click_stats failed: {e}", file=sys.stderr)
 
     keywords: list[dict[str, Any]] = []
     for key, kw in relevant.items():
@@ -208,7 +210,8 @@ def _fetch_baidu_hotspots() -> list[dict[str, Any]]:
             follow_redirects=True,
         )
         resp.raise_for_status()
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Baidu hotspot scrape failed: {e}", file=sys.stderr)
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -254,7 +257,8 @@ def _fetch_zhihu_hotspots() -> list[dict[str, Any]]:
             follow_redirects=True,
         )
         resp.raise_for_status()
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Zhihu hotspot scrape failed: {e}", file=sys.stderr)
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -366,10 +370,8 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
                     all_results.extend(cached)
                     keywords_searched += 1
                     continue
-            except Exception:
-                pass
-
-        # Real search — try engines in order.
+            except Exception as e:
+                print(f"  [WARN] search cache read failed for '{keyword}': {e}", file=sys.stderr)
         # Lazy VPN check: only probe DDG reachability on first cache miss,
         # avoiding wasted HTTP calls when all keywords hit the 24h cache.
         if not vpn_checked:
@@ -392,10 +394,8 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
                     result_count=len(results),
                     called_by="hot_tracker",
                 )
-            except Exception:
-                pass
-
-        keywords_searched += 1
+            except Exception as e:
+                print(f"  [WARN] search cache write failed for '{query}': {e}", file=sys.stderr)
 
     # ── Dedup by URL ──
     seen_urls: set[str] = set()
@@ -424,10 +424,24 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
             ]
             db.insert_hot_topic_news_deduped(records, date)
 
-            # Mark top 7 as selected (simple: first 7 by search order)
-            urls = [r["url"] for r in records[:7] if r["url"]]
-            if urls:
-                db.mark_hot_topic_selected(urls, date)
+            # ── AI-powered selection + summarization ──
+            # Replaces the old "first 7 by search order" with semantic judgment.
+            # Falls back to simple first-7 on any Agent failure.
+            try:
+                ai_selected = _ai_filter_hot_topics(unique_results, date)
+                if ai_selected:
+                    urls = [r["url"] for r in ai_selected if r.get("url")]
+                    if urls:
+                        db.mark_hot_topic_selected(urls, date)
+                    # Persist AI summaries back to DB for render to use
+                    _persist_ai_summaries(ai_selected, date, db)
+            except Exception as e:
+                print(f"  [WARN] Hot Tracker Agent failed, using fallback: {e}",
+                      file=sys.stderr)
+                # Fallback: simple first 7 by search order
+                urls = [r["url"] for r in records[:7] if r["url"]]
+                if urls:
+                    db.mark_hot_topic_selected(urls, date)
         except Exception as e:
             warnings.append(f"Failed to write hot topic news to DB: {e}")
 
@@ -471,7 +485,8 @@ def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, An
                 for r in results:
                     r["search_engine"] = engine_name
                 return results
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] search engine '{engine_name}' failed: {e}", file=sys.stderr)
             continue
 
     return []
@@ -487,5 +502,168 @@ def _check_ddg_reachable() -> bool:
             timeout=8.0,
         )
         return resp.status_code == 200
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] DDG reachability check failed: {e}", file=sys.stderr)
         return False
+# ═══════════════════════════════════════════════════════════════════
+
+class _HotSelectedItem(BaseModel):
+    """A single AI-selected hot topic item."""
+    id: int                         # index into the candidates list
+    ai_summary: str = ""            # 1-2 sentence Chinese summary
+    value_score: int = 0            # 0-100 business value score
+
+
+class _HotFilterOutput(BaseModel):
+    """Validated output from the Hot Tracker Agent."""
+    selected: list[_HotSelectedItem] = []
+    discarded_count: int = 0
+
+
+def _ai_filter_hot_topics(
+    candidates: list[dict[str, Any]], date: str
+) -> list[dict[str, Any]]:
+    """Run the Hot Tracker Agent to filter + summarise search results.
+
+    The Agent gets a web_fetch tool so it can open URLs when the search
+    snippet alone isn't enough to judge business value.  This is the
+    system's only real Agent — it has a tool loop because the search
+    results often have insufficient context for a single-call judgment.
+
+    Returns up to 7 enriched items (original fields + ai_summary + value_score),
+    or an empty list on total failure (caller falls back to simple first-7).
+    """
+    if not candidates:
+        return []
+
+    from src.agents.base import Agent, Tool
+
+    # ── Limit input to keep prompt size reasonable ──
+    MAX_CANDIDATES = 30
+    working = candidates[:MAX_CANDIDATES]
+
+    # ── Build candidates JSON for the prompt ──
+    candidates_for_prompt = []
+    for i, c in enumerate(working):
+        candidates_for_prompt.append({
+            "id": i,
+            "title": c.get("title", "") or c.get("headline", ""),
+            "url": c.get("url", ""),
+            "snippet": (c.get("snippet", "") or "")[:200],
+            "keyword": c.get("keyword", ""),
+        })
+    candidates_json = json.dumps(candidates_for_prompt, ensure_ascii=False, indent=2)
+
+    # ── web_fetch tool (wraps enrichment.fetch_article_body) ──
+    def _web_fetch(url: str, **_kw: Any) -> str:
+        """Fetch the body text of a web page. Use when a search snippet
+        is too short to judge whether the article is valuable for
+        game-industry decision-makers."""
+        if not url:
+            return json.dumps({"error": "empty URL"}, ensure_ascii=False)
+        try:
+            from src.agents.enrichment import fetch_article_body
+            body = fetch_article_body(url, timeout=10)
+            if not body:
+                return json.dumps(
+                    {"status": "empty", "hint": "page returned no readable text"},
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {"status": "ok", "text": body[:600]},
+                ensure_ascii=False,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    web_fetch_tool = Tool(
+        name="web_fetch",
+        description=(
+            "Fetch the body text of a web page. Use this when a search "
+            "result's snippet is too short to judge its business value. "
+            "Only call this for candidates that look promising but need "
+            "more context — do NOT fetch every candidate."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The full URL to fetch (from the candidate list)",
+                },
+            },
+            "required": ["url"],
+        },
+        fn=_web_fetch,
+    )
+
+    # ── Run the Agent ──
+    agent = Agent(
+        "hot_tracker",
+        tools=[web_fetch_tool],
+        max_tool_rounds=4,
+        max_tokens=8192,
+        output_schema=_HotFilterOutput,
+    )
+
+    try:
+        result = agent.run(
+            date=date,
+            total_candidates=len(working),
+            keyword_count=len({c.get("keyword", "") for c in working}),
+            candidates_json=candidates_json,
+            _verbose=False,
+        )
+    except Exception as e:
+        print(f"  [WARN] Hot Tracker Agent.run() failed: {e}", file=sys.stderr)
+        return []
+
+    selected = result.get("selected") or []
+    if not selected:
+        return []
+
+    # ── Map agent output back to original candidate dicts ──
+    enriched: list[dict[str, Any]] = []
+    for item in selected:
+        idx = item.get("id", -1) if isinstance(item, dict) else getattr(item, "id", -1)
+        if idx < 0 or idx >= len(working):
+            continue
+        candidate = dict(working[idx])
+        candidate["ai_summary"] = (
+            item.get("ai_summary", "")
+            if isinstance(item, dict)
+            else getattr(item, "ai_summary", "")
+        )
+        candidate["value_score"] = (
+            item.get("value_score", 0)
+            if isinstance(item, dict)
+            else getattr(item, "value_score", 0)
+        )
+        enriched.append(candidate)
+
+    # Sort by value_score descending, return top 7
+    enriched.sort(key=lambda x: x.get("value_score", 0), reverse=True)
+    return enriched[:7]
+
+
+def _persist_ai_summaries(
+    selected: list[dict[str, Any]], date: str, db: Any
+) -> None:
+    """Write AI summaries back to hot_topic_news rows matched by URL."""
+    try:
+        conn = db._connect()
+        for item in selected:
+            url = item.get("url", "")
+            summary = item.get("ai_summary", "")
+            score = item.get("value_score", 0)
+            if url and summary:
+                conn.execute(
+                    """UPDATE hot_topic_news
+                       SET ai_summary = ?, value_score = ?
+                       WHERE url = ? AND date = ?""",
+                    (summary, score, url, date),
+                )
+        conn.commit()
+    except Exception as e:
+        print(f"  [WARN] AI summary persistence failed: {e}", file=sys.stderr)
+        # best-effort — summaries are non-critical

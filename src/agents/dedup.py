@@ -7,10 +7,15 @@ any future module that needs to check/save reported items.
 
 Item types and their TTLs:
   news       — pushed top-7 headlines (30-day TTL)
-  news_seen  — all 15 candidates seen (7-day TTL)
   news_h     — headline dedup tokens for cross-source comparison (30-day TTL)
   steam      — Steam port game names (30-day TTL)
   taptap     — TapTap new game names (30-day TTL)
+
+Design note (2026-06-26): news_seen type was removed. It used to save ALL
+candidate URLs (including non-selected ones) with a 7-day TTL, but this
+starved the pipeline — 30+ non-published candidates from yesterday were
+blocked from reconsideration today. Only published items (news type) are
+now saved for cross-day dedup. apply_fatigue() handles topic repetition.
 """
 
 from __future__ import annotations
@@ -27,15 +32,15 @@ from typing import Any
 def load_reported_news() -> set[str]:
     """Load normalized URLs of news already pushed in previous reports.
 
-    Checks both long-term ('news') and short-term ('news_seen') dedup records.
+    Only checks the 'news' type (30-day TTL) — items that were actually
+    published in a daily report. Non-selected candidates are NOT dedup'd
+    across days; they get a fresh chance at scoring tomorrow.
     """
     try:
         from src.storage.sqlite import get_db
-        db = get_db()
-        urls = db.get_reported_keys("news")
-        urls |= db.get_reported_keys("news_seen")
-        return urls
-    except Exception:
+        return get_db().get_reported_keys("news")
+    except Exception as e:
+        print(f"  [WARN] load_reported_news failed: {e}", file=sys.stderr)
         return set()
 
 
@@ -44,7 +49,8 @@ def load_reported_news_headlines() -> set[str]:
     try:
         from src.storage.sqlite import get_db
         return get_db().get_reported_keys("news_h")
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] load_reported_news_headlines failed: {e}", file=sys.stderr)
         return set()
 
 
@@ -87,28 +93,6 @@ def save_reported_news(urls: set[str], date: str,
             print(f"   [warn] DB headline tokens save failed: {e}")
 
 
-def save_seen_candidates(candidates: list[dict[str, Any]], date: str) -> None:
-    """Save ALL candidate URLs to dedup table with short TTL (7 days).
-
-    This prevents the same low-scoring articles from being reconsidered
-    day after day when they persistently appear in scraper output.
-    Items that make it to the final top-7 are separately saved as 'news'
-    with a 30-day TTL via save_reported_news().
-    """
-    urls = {re.sub(r'[?#].*$', '', c.get("url", "")) for c in candidates if c.get("url")}
-    if not urls:
-        return
-    try:
-        from src.storage.sqlite import get_db
-        db = get_db()
-        n = db.mark_reported(urls, "news_seen", date)
-        db.prune_reported("news_seen", max_age_days=7)
-        if n:
-            print(f"   DB: marked {n} candidate URLs as seen (7-day TTL)")
-    except Exception as e:
-        print(f"   [warn] DB candidate save failed: {e}")
-
-
 # ═════════════════════════════════════════════════════════════
 # Steam port dedup
 # ═════════════════════════════════════════════════════════════
@@ -131,7 +115,8 @@ def load_reported_steam(target_date: str = "") -> set[str]:
             ).fetchall():
                 reported.add(row["game_name"])
         return reported
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] load_reported_steam failed: {e}", file=sys.stderr)
         return set()
 
 
@@ -173,7 +158,8 @@ def load_reported_taptap(target_date: str = "") -> set[str]:
             ).fetchall():
                 reported.add(row["game_name"])
         return reported
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] load_reported_taptap failed: {e}", file=sys.stderr)
         return set()
 
 

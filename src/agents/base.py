@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time as _time
 import uuid as _uuid
 from typing import Any
@@ -467,7 +468,8 @@ class Agent:
                 cache_hit=cache_hit,
                 latency_ms=latency_ms,
             )
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] audit log insert failed: {e}", file=sys.stderr)
             pass  # audit logging must never block the agent
 
         return result_str

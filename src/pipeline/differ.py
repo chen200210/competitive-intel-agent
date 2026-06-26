@@ -12,6 +12,8 @@ Usage:
 
 from typing import Any
 
+import sys
+
 from src.storage.sqlite import get_db
 
 
@@ -118,7 +120,8 @@ def compute_attention_score(
             from src.pipeline.track_filter import classify_game
             if classify_game(game_name) == "track":
                 score += 1.5
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] track classification failed for {game_name}: {e}", file=sys.stderr)
             pass
 
     return min(score, 10.0)

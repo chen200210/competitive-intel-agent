@@ -75,7 +75,8 @@ def _load_track_config() -> dict[str, Any]:
             with open(yaml_path, encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             return config.get("track_config", {})
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Failed to load track_config from YAML: {e}", file=sys.stderr)
         pass
     return {}
 
@@ -268,7 +269,8 @@ def filter_track_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 name = g.get("name", "") if isinstance(g, dict) else str(g)
                 if name:
                     monitored_names.add(name.lower())
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Failed to load monitored_games from YAML: {e}", file=sys.stderr)
         pass
 
     filtered: list[dict[str, Any]] = []

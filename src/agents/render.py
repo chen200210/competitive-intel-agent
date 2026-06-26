@@ -376,17 +376,20 @@ def build_hot_topics_md(
         kw = item.get("keyword", "")
         headline = item.get("headline", "")
         snippet = item.get("snippet", "")
+        ai_summary = item.get("ai_summary", "")
         url = item.get("url", "")
         source = item.get("source", "") or extract_domain(url)
 
-        # Truncate snippet to ~120 chars for readability
-        if len(snippet) > 120:
-            snippet = snippet[:120] + "..."
+        # Prefer AI summary over raw search snippet when available
+        summary_text = ai_summary if ai_summary else snippet
+        if len(summary_text) > 140:
+            summary_text = summary_text[:140] + "..."
 
         kw_tag = f"[{kw}] " if kw else ""
         lines.append(f"**{i + 1}. {kw_tag}{headline}**")
-        if snippet:
-            lines.append(f"> {snippet}")
+        if summary_text:
+            ai_tag = " 🤖" if ai_summary else ""
+            lines.append(f"> {summary_text}{ai_tag}")
         if url:
             src_tag = f" · `{source}`" if source else ""
             lines.append(f"→ [原文]({url}){src_tag}")

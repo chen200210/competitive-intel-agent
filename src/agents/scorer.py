@@ -43,6 +43,7 @@ def load_scoring_config() -> dict[str, Any]:
         "top_n": 7,
         "max_bilibili": 2,
         "max_per_source": 3,
+        "prefilter_signal_threshold": _PREFILTER_SIGNAL_THRESHOLD_DEFAULT,
     }
     try:
         import yaml
@@ -54,8 +55,8 @@ def load_scoring_config() -> dict[str, Any]:
             yaml_scoring = config.get("track_config", {}).get("scoring", {})
             if yaml_scoring:
                 return {**defaults, **yaml_scoring}
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [WARN] Failed to load scoring config from YAML: {e}, using defaults", file=sys.stderr)
     return defaults
 
 
@@ -82,7 +83,6 @@ _VALID_NEG_LABELS: frozenset[str] = frozenset({
 class SummarizerOutput(BaseModel):
     """Validated output from the summarizer AI."""
     candidates: dict[str, NewsScore]  # key = candidate index as string
-    duplicates: list[list[int]] = []  # pairs of indices that are the same story, e.g. [[2,7], [3,5]]
 
 
 # ═════════════════════════════════════════════════════════════
@@ -132,8 +132,8 @@ def build_feedback_summary(days: int = 14) -> str:
                     f"信息密度={dw.get('density', 40)}, "
                     f"行业洞察={dw.get('insight', 20)}"
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [WARN] Failed to read calibration dim_weights: {e}", file=sys.stderr)
 
         if not rows:
             return "（暂无用户反馈数据，按默认标准打分即可）" + calib_note
@@ -147,7 +147,8 @@ def build_feedback_summary(days: int = 14) -> str:
                 f"| {src} | {r['up']} | {r['down']} | {h} |"
             )
         return "\n".join(lines) + calib_note
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] build_feedback_summary failed: {e}", file=sys.stderr)
         return "（反馈数据读取失败，按默认标准打分即可）"
 
 
@@ -390,7 +391,15 @@ def _fmt_body(body: str, fatigue: str) -> str:
 
 # Max attempts for distribution-compliance retry (outside Agent's own
 # schema-validation retries handled in base.py).
-_MAX_DIST_RETRIES = 3
+# Value 2: first attempt may cluster → retry_context feedback → second
+# attempt self-corrects.  A single API failure also gets one retry.
+_MAX_DIST_RETRIES = 2
+
+# Pre-filter threshold: candidates with signal_score below this are
+# almost certain to fail the min_ai_score quality gate (default 40).
+# Skipping them saves AI input tokens with zero impact on final output.
+# Read from YAML when available, otherwise this constant is the fallback.
+_PREFILTER_SIGNAL_THRESHOLD_DEFAULT = 15
 
 
 def ai_summarize_and_judge(
@@ -415,22 +424,52 @@ def ai_summarize_and_judge(
 
     cfg = load_scoring_config()
     min_ai_score: int = cfg["min_ai_score"]
+    prefilter_threshold: int = cfg["prefilter_signal_threshold"]
     if top_n is None:
         top_n = cfg["top_n"]
     max_bilibili: int = cfg["max_bilibili"]
 
-    # ── Extract body signals for each candidate (zero token) ──
+    # ── Pre-filter + cache: compute body signals once for all passes ──
+    # _body_cache avoids recomputing _fmt_body / _extract_body_signals /
+    # _compute_signal_score in the items_json builder and the β-fusion loop.
+    # Keyed by candidate index → (formatted_body, signals_dict, signal_score).
+    # CRITICAL: signals are extracted from the RAW body (not _fmt_body) to
+    # avoid the fatigue prefix ("昨日话题…") polluting freshness markers.
+    _body_cache: dict[int, tuple[str, dict[str, Any], float]] = {}
+    prefiltered: set[int] = set()
+    for i, c in enumerate(candidates):
+        raw_body = c.get("body", "") or ""
+        signals = _extract_body_signals(raw_body)
+        ss = _compute_signal_score(signals)
+        _body_cache[i] = (_fmt_body(raw_body, c.get("fatigue", "")), signals, ss)
+        if ss < prefilter_threshold:
+            prefiltered.add(i)
+
+    # Number of candidates the AI actually scores — used for distribution
+    # checks, retry thresholds, and fallback calculations so prefiltered
+    # zeros don't pollute the math.
+    ai_scored_count = len(candidates) - len(prefiltered)
+
+    # ── Build AI prompt only from survivors (cached signals) ──
     items_json = json.dumps([
         {
             "id": i,
             "headline": c.get("headline", ""),
             "source": c.get("source", ""),
             "track_relevant": c.get("track_relevant", False),
-            "body": (fb := _fmt_body(c.get("body", "") or "", c.get("fatigue", "")))[:500],
-            "signals": _extract_body_signals(fb),
+            "body": _body_cache[i][0][:500],
+            "signals": _body_cache[i][1],
         }
         for i, c in enumerate(candidates)
+        if i not in prefiltered
     ], ensure_ascii=False, indent=2)
+
+    if prefiltered and verbose:
+        print(
+            f"   [prefilter] {len(prefiltered)}/{len(candidates)} candidates "
+            f"skipped (signal_score < {prefilter_threshold})",
+            file=sys.stderr,
+        )
 
     feedback_summary = build_feedback_summary()
 
@@ -460,7 +499,8 @@ def ai_summarize_and_judge(
                 retry_context=retry_context,
                 _verbose=False,  # keep agent chatter quiet; we print our own table
             )
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] summarizer agent.run() failed (attempt {attempt+1}): {e}", file=sys.stderr)
             if attempt < _MAX_DIST_RETRIES - 1:
                 retry_context = "\n⚠️ 上一次调用失败，请重新输出完整 JSON。\n"
                 continue
@@ -475,16 +515,20 @@ def ai_summarize_and_judge(
                 file=sys.stderr,
             )
 
-        # Extract all scores for distribution check
+        # Extract scores ONLY from AI-scored indices (prefiltered never sent).
+        # Using range(len(candidates)) would insert zeros for prefiltered
+        # items, inflating below_40 and hiding AI distribution failures.
         scores: list[int] = []
         for i in range(len(candidates)):
+            if i in prefiltered:
+                continue
             raw = raw_candidates.get(str(i), {})
             try:
                 scores.append(int(raw.get("score", 0) or 0))
             except (ValueError, TypeError):
                 scores.append(0)
 
-        dist_ok, dist_msg, dist_counts = _check_distribution(scores, len(candidates))
+        dist_ok, dist_msg, dist_counts = _check_distribution(scores, ai_scored_count)
         if verbose:
             print(
                 f"   [dist] attempt {attempt+1}: {dist_msg}",
@@ -495,8 +539,8 @@ def ai_summarize_and_judge(
             break
 
         if attempt < _MAX_DIST_RETRIES - 1:
-            need_below = max(1, int(len(candidates) * 0.25))
-            max_above = int(len(candidates) * 0.30)   # must match _check_distribution
+            need_below = max(1, int(ai_scored_count * 0.25))
+            max_above = int(ai_scored_count * 0.30)   # must match _check_distribution
             retry_context = (
                 f"\n⚠️ 上一次打分分布不合格：{dist_msg}\n"
                 f"低于40分的需要 ≥{need_below} 条（实际 {dist_counts['below_40']} 条）。\n"
@@ -514,7 +558,10 @@ def ai_summarize_and_judge(
         if verbose:
             print("   [warn] AI returned no candidates after all retries, using fallback", file=sys.stderr)
         fallback: list[dict[str, Any]] = []
-        for c in candidates[:top_n]:
+        taken = 0
+        for i, c in enumerate(candidates):
+            if i in prefiltered:
+                continue
             item = dict(c)
             item.setdefault("ai_summary", "")
             item.setdefault("ai_score", 0)
@@ -522,13 +569,21 @@ def ai_summarize_and_judge(
             item.setdefault("pos_label", "")
             item.setdefault("neg_label", "")
             fallback.append(item)
+            taken += 1
+            if taken >= top_n:
+                break
         return fallback
 
     # ── Build all_items from (possibly fallback-adjusted) raw_candidates ──
+    # Prefiltered items are skipped — they were never sent to the AI and
+    # their signal_score guarantees they
+    # fail the quality gate (min_ai_score ≥ 40).  Excluding them keeps
+    # distribution counts and _apply_score_fallback band calculations correct.
     all_items: dict[int, dict[str, Any]] = {}  # orig_idx → scored item
     for i, c in enumerate(candidates):
+        if i in prefiltered:
+            continue
         item = dict(c)
-        item["_orig_idx"] = i
         raw = raw_candidates.get(str(i), {})
         item["ai_summary"] = raw.get("summary", "") or ""
         try:
@@ -547,9 +602,8 @@ def ai_summarize_and_judge(
         # ── β-Fusion: blend code-layer signal_score with AI score ──
         # Runs BEFORE distribution check — spreads scores naturally,
         # reducing retry frequency.  signal_score is zero-token (regex).
-        body_for_signals = _fmt_body(c.get("body", "") or "", c.get("fatigue", ""))
-        signals = _extract_body_signals(body_for_signals)
-        signal_score = _compute_signal_score(signals)
+        # Values are read from _body_cache (computed once in pre-filter pass).
+        _, _signals_unused, signal_score = _body_cache[i]
         item["signal_score"] = int(signal_score)
 
         ai_s = item["ai_score"]
@@ -586,85 +640,29 @@ def ai_summarize_and_judge(
                         f"(calibration v{calib.get('version', 0)})",
                         file=sys.stderr,
                     )
-    except Exception:
-        pass  # best-effort — never block scoring on calibration error
+    except Exception as e:
+        print(f"  [WARN] calibration apply failed: {e}", file=sys.stderr)
+        # best-effort — never block scoring on calibration error
 
     # ── Distribution enforcement: FINAL guard after all score adjustments ──
     # β-fusion and topic_boosts have already spread scores.  Only apply
     # fallback if distribution is still non-compliant.
     scores_after_adjustments = [item["ai_score"] for item in all_items.values()]
-    dist_ok, dist_msg, _ = _check_distribution(scores_after_adjustments, len(candidates))
+    dist_ok, dist_msg, _ = _check_distribution(scores_after_adjustments, len(all_items))
     if not dist_ok:
         if verbose:
             print(f"   [dist] post-adjustment distribution needs correction: {dist_msg}",
                   file=sys.stderr)
-        _apply_score_fallback(all_items, len(candidates))
+        _apply_score_fallback(all_items, len(all_items))
 
-    # ── AI-flagged duplicates: compute connected components, keep only the
-    #     highest-scoring item per component ──
-    removed: set[int] = set()  # ids of items to drop
-    try:
-        ai_duplicates: list[list[int]] = result.get("duplicates") or []
-        if ai_duplicates:
-            # Build adjacency graph from validated pairs
-            graph: dict[int, set[int]] = {}
-            for pair in ai_duplicates:
-                if not isinstance(pair, (list, tuple)):
-                    continue
-                if len(pair) < 2:
-                    continue
-                a, b = pair[0], pair[1]
-                if not (isinstance(a, int) and not isinstance(a, bool)
-                        and isinstance(b, int) and not isinstance(b, bool)):
-                    continue
-                if a == b:
-                    continue
-                graph.setdefault(a, set()).add(b)
-                graph.setdefault(b, set()).add(a)
+    # Duplicate detection is handled by _is_same_story() in _select_top_n()
+    # (AI summary Jaccard similarity + named-entity overlap), which covers
+    # cross-language duplicates that Phase-A URL/token dedup misses.
 
-            # Find connected components (DFS)
-            seen: set[int] = set()
-            for node in graph:
-                if node in seen:
-                    continue
-                comp: set[int] = set()
-                stack = [node]
-                while stack:
-                    n = stack.pop()
-                    if n in seen:
-                        continue
-                    seen.add(n)
-                    comp.add(n)
-                    stack.extend(graph.get(n, set()) - seen)
-                if len(comp) <= 1:
-                    continue
-                # Keep the highest-scoring item in this component
-                items_in_comp = [
-                    (idx, all_items[idx]) for idx in comp if idx in all_items
-                ]
-                if len(items_in_comp) <= 1:
-                    continue
-                items_in_comp.sort(key=lambda x: x[1]["ai_score"], reverse=True)
-                # Drop all but the winner
-                for idx, item in items_in_comp[1:]:
-                    removed.add(id(item))
-                    if verbose:
-                        print(
-                            f"   [dedup] duplicate of #{items_in_comp[0][0]} — "
-                            f"dropping #{idx} ({item['ai_score']} pts): "
-                            f"{item['headline'][:50]}",
-                            file=sys.stderr,
-                        )
-    except Exception:
-        print(
-            f"   [warn] dedup failed, proceeding without dedup",
-            file=sys.stderr,
-        )
-
-    # ── Quality gate + dedup removal ──
+    # ── Quality gate ──
     all_scored: list[dict[str, Any]] = [
-        item for idx, item in all_items.items()
-        if item["ai_score"] >= min_ai_score and id(item) not in removed
+        item for item in all_items.values()
+        if item["ai_score"] >= min_ai_score
     ]
 
     # Sort by AI score descending, then apply source diversity

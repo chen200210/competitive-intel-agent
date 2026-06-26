@@ -133,14 +133,11 @@ system: |
         "neg_label": "no_gameplay",
         "verdict": "仅公告免费，无玩法介绍"
       }}
-    }},
-    "duplicates": [[2, 7]]
+    }}
   }}
 
   必须为每条候选生成 summary、score、pos_label、neg_label、verdict。
   pos_label 和 neg_label 必须从上述标签池中选择，不匹配时填空字符串。
-
-  **重复检测**：如果多条候选讲的是同一个事件（例如中文翻译和英文原文都报道了同一条彭博社新闻），在 duplicates 数组中列出它们的索引对，如 [[2,7], [3,5]]。没有发现重复就写 []。
 
 user_template: |
   请为 {date} 的新闻候选池撰写摘要和打分。今日类型：{day_type}。

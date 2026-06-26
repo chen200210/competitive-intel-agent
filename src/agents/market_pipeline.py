@@ -163,7 +163,8 @@ def filter_news(news: list[dict[str, Any]], target_date: str = "",
             # detects track relevance.
             if classification == "track" and not n.get("track_relevant"):
                 n["track_relevant"] = True
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] classify_game failed in filter_news: {e}", file=sys.stderr)
             pass  # best-effort, don't block news on classifier error
 
         # ── 二次元行业分析过滤 ──

@@ -108,9 +108,9 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
                 conn.execute("DELETE FROM changes WHERE date = ?", (date,))
                 # Clear news dedup records for the date so re-runs
                 # (especially --brief-only) don't accumulate stale
-                # URL blocks from previous brief() → save_seen_candidates calls.
+                # URL blocks from previous brief() → save_reported_news calls.
                 conn.execute(
-                    "DELETE FROM reported_items WHERE item_type IN ('news','news_seen','news_h')"
+                    "DELETE FROM reported_items WHERE item_type IN ('news','news_h')"
                     " AND reported_date = ?", (date,)
                 )
                 # Clean non-ranking data accidentally imported from scraper CSVs.
@@ -172,8 +172,8 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
             if bvideos:
                 from src.agents.briefer import _bilibili_to_news
                 bilibili_news = _bilibili_to_news(bvideos)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [WARN] Failed to fetch bilibili videos for audit: {e}", file=sys.stderr)
 
         audit_ctx = AuditContext(
             taptap_games=db.get_taptap_games_by_date(date),
@@ -221,8 +221,9 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
             error_summary=error_summary[:500],
             total_ms=total_ms,
         )
-    except Exception:
-        pass  # best-effort monitoring, never break the pipeline
+    except Exception as e:
+        print(f"  [WARN] insert_pipeline_run failed: {e}", file=sys.stderr)
+        # best-effort monitoring, never break the pipeline
 
     print(f"\n{'='*50}")
     print(f"  Pipeline complete: {total_s:.1f}s total")
@@ -286,7 +287,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
                 _counter_map[r["url"]] = (uc, dc)
         conn.execute("DELETE FROM market_news WHERE date = ?", (date,))
         conn.execute(
-            "DELETE FROM reported_items WHERE item_type IN ('news','news_seen','news_h')"
+            "DELETE FROM reported_items WHERE item_type IN ('news','news_h')"
             " AND reported_date = ?", (date,)
         )
         conn.commit()
@@ -373,7 +374,21 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
             elapsed = r.get("elapsed", 0)
             print(f"  {tag:6s} {r['name']:<30s} ({elapsed:.0f}s)")
             if status == "error":
-                print(f"         {r.get('error', '')[:120]}")
+                err_msg = r.get('error', '')
+                # Print full error (at least first 500 chars) so scraper failures
+                # like B站 timeouts aren't silently lost behind truncated output.
+                print(f"         {err_msg[:500]}")
+                if len(err_msg) > 500:
+                    print(f"         ... ({len(err_msg)} total chars, truncated)")
+            # subprocess.run doesn't raise on non-zero exit (no check=True),
+            # so we must inspect the CompletedProcess returncode ourselves.
+            if status == "ok" and hasattr(r.get("result", None), "returncode"):
+                proc = r["result"]
+                if proc.returncode != 0:
+                    stderr_out = (proc.stderr or "")[:500]
+                    print(f"  [WARN] {r['name']} exit code {proc.returncode}")
+                    if stderr_out.strip():
+                        print(f"         {stderr_out}")
 
     # ── Restore feedback counters after scraper re-insert ──
     if _counter_map:

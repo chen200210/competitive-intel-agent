@@ -75,7 +75,7 @@ def brief(
     from src.agents.market_pipeline import filter_news, apply_fatigue, deep_fetch
     from src.agents.scorer import ai_summarize_and_judge
     from src.agents.dedup import (
-        save_seen_candidates, save_reported_news, headline_dedup_tokens,
+        save_reported_news, headline_dedup_tokens,
     )
 
     # ── Build new games + ranking markdown in code (zero AI) ──
@@ -87,11 +87,11 @@ def brief(
 
     # ── News pipeline: hard filter → fatigue check → deep fetch → AI summarize ──
     # Phase A: hard filters only (block kw + dedup + freshness + track ignored)
+    # NOTE: Non-selected candidates are NOT saved as "seen" — they are
+    # reconsidered alongside new candidates the next day. Only the final
+    # published top-N items are marked as reported (news type, 30-day TTL).
+    # Topic fatigue (apply_fatigue) handles cross-day repetition control.
     candidates = filter_news(market_news or [], target_date=date)
-
-    # Save ALL candidate URLs to dedup table (short TTL) so items that
-    # repeatedly appear in scraper output don't get reconsidered every day.
-    save_seen_candidates(candidates, date)
 
     # Phase A2: fatigue check — downgrade/block topics seen in recent reports
     candidates = apply_fatigue(candidates, date)
@@ -131,8 +131,9 @@ def brief(
                 if verbose:
                     print(f"   [labels] persisted {updated} label annotations to market_news",
                           file=sys.stderr)
-        except Exception:
-            pass  # best-effort — never block card generation on label persistence
+        except Exception as e:
+            print(f"  [WARN] label persistence failed: {e}", file=sys.stderr)
+            # best-effort — never block card generation on label persistence
 
     # Phase E: code-generated market section markdown (zero AI, deterministic).
     # The briefer LLM previously handled this, but it sometimes invented
@@ -441,7 +442,8 @@ def _bilibili_to_news(videos: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     try:
         from src.pipeline.track_filter import classify_game
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] track_filter import failed, B站 videos will not be classified: {e}", file=sys.stderr)
         classify_game = None
 
     news_items = []

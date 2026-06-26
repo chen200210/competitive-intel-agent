@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from typing import Any
 
 import lark_oapi as lark
@@ -280,7 +281,8 @@ def upload_image(image_url: str) -> dict[str, Any]:
                 img.save(buf, format=save_fmt, quality=85)
                 image_bytes = buf.getvalue()
                 content_type = f"image/{save_fmt.lower()}"
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] image conversion failed, keeping original: {e}", file=sys.stderr)
             pass  # keep original bytes if conversion fails
 
         # Get tenant access token

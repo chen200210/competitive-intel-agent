@@ -1,12 +1,14 @@
 """
 Calibrator Agent — feedback-driven scoring parameter tuning.
 
-Consumes user_feedback data (👍/👎 on daily report news), uses LLM to
-discover preference patterns, and outputs versioned calibration parameters
-that the Summarizer reads to adjust its scoring.
+Consumes user_feedback data (👍/👎 on daily report news), uses a pure
+rule engine to discover preference patterns (zero token), and outputs
+versioned calibration parameters that the Summarizer reads to adjust
+its scoring.
 
 Runs weekly (or on demand when feedback accumulates ≥30 items).
-Design inspired by RecGPT's LLM-as-a-Judge evaluation chain.
+Design inspired by RecGPT's LLM-as-a-Judge evaluation chain — the
+LLM has been replaced by a statistically-equivalent rule engine (RED-3).
 
 Usage:
     python -m src.agents.calibrator --days 14
@@ -34,6 +36,35 @@ ALLOWED_TOPIC_KEYS: frozenset[str] = frozenset({
 
 DEFAULT_DIM_WEIGHTS: dict[str, int] = {"track": 40, "density": 40, "insight": 20}
 
+# ═════════════════════════════════════════════════════════════
+# Topic → keyword map (rule engine)
+# ═════════════════════════════════════════════════════════════
+# Each ALLOWED_TOPIC_KEY is mapped to a list of Chinese/English
+# keyword patterns.  The rule engine scans feedback headlines
+# for these keywords to attribute user sentiment to topics.
+#
+# When adding a new topic to ALLOWED_TOPIC_KEYS, add its keyword
+# list here too — the rule engine looks up this map, not the YAML.
+
+TOPIC_KEYWORD_MAP: dict[str, list[str]] = {
+    "独立游戏": ["独立游戏", "indie", "独立开发", "个人开发者", "独游"],
+    "AI游戏": ["AI", "人工智能", "AIGC", "大模型", "LLM", "GPT", "AI游戏"],
+    "大厂动态": ["腾讯", "网易", "米哈游", "字节", "莉莉丝", "叠纸", "鹰角",
+                  "三七", "完美世界", "巨人"],
+    "人事变动": ["离职", "入职", "任命", "CEO", "高管", "人事", "裁员", "跳槽"],
+    "海外市场": ["海外", "出海", "全球", "欧美", "日本", "韩国", "东南亚", "中东",
+                 "北美", "欧洲"],
+    "买量数据": ["买量", "投放", "广告", "CPI", "ROI", "LTV", "获客", "买量成本"],
+    "小游戏": ["小游戏", "小程序", "微信小游戏", "H5游戏", "迷你游戏", "休闲游戏"],
+    "Steam移植": ["Steam", "steam", "移植", "端游", "PC版", "PC端"],
+    "新游首曝": ["首曝", "首测", "首爆", "定档", "首曝", "首测"],
+    "版号": ["版号", "审批", "过审"],
+    "投融资": ["融资", "投资", "收购", "并购", "IPO", "估值", "融资额"],
+    "IP授权": ["IP", "联动", "授权", "改编", "合作IP"],
+    "电竞": ["电竞", "赛事", "联赛", "冠军", "eSports", "锦标赛", "总决赛"],
+    "二次元": ["二次元", "动漫", "anime", "日系", "原神", "崩坏", "少女前线"],
+}
+
 
 # ═════════════════════════════════════════════════════════════
 # Output schema
@@ -48,7 +79,7 @@ class CalibratorFinding(BaseModel):
 
 
 class CalibratorOutput(BaseModel):
-    """Validated output from the Calibrator LLM call.
+    """Validated output from the Calibrator rule engine.
 
     Includes a model_validator that enforces the Matched Interest Pool
     contracts declared in prompts/calibrator.yaml:
@@ -56,7 +87,7 @@ class CalibratorOutput(BaseModel):
       - dim_weights keys must be the three recognized dimensions
       - dim_weights must sum to 100
     Unknown topic keys are dropped with a warning; out-of-range values
-    are clamped.  This prevents one bad LLM output from poisoning the
+    are clamped.  This prevents one bad output from poisoning the
     calibration history (Angle G finding 3).
     """
     topic_boosts: dict[str, int] = {}
@@ -70,7 +101,7 @@ class CalibratorOutput(BaseModel):
         unknown = [k for k in self.topic_boosts if k not in ALLOWED_TOPIC_KEYS]
         for k in unknown:
             print(
-                f"  [WARN] Calibrator LLM output unknown topic key '{k}' — dropped",
+                f"  [WARN] Calibrator output unknown topic key '{k}' — dropped",
                 file=sys.stderr,
             )
             del self.topic_boosts[k]
@@ -79,7 +110,7 @@ class CalibratorOutput(BaseModel):
         for k, v in list(self.topic_boosts.items()):
             if not isinstance(v, (int, float)):
                 print(
-                    f"  [WARN] Calibrator LLM output non-numeric boost for '{k}': {v} — dropped",
+                    f"  [WARN] Calibrator output non-numeric boost for '{k}': {v} — dropped",
                     file=sys.stderr,
                 )
                 del self.topic_boosts[k]
@@ -93,7 +124,7 @@ class CalibratorOutput(BaseModel):
         extra_dims = [k for k in self.dim_weights if k not in valid_dims]
         for k in extra_dims:
             print(
-                f"  [WARN] Calibrator LLM output unknown dim_weight key '{k}' — dropped",
+                f"  [WARN] Calibrator output unknown dim_weight key '{k}' — dropped",
                 file=sys.stderr,
             )
             del self.dim_weights[k]
@@ -101,13 +132,165 @@ class CalibratorOutput(BaseModel):
         total = sum(self.dim_weights.values())
         if total != 100:
             print(
-                f"  [WARN] Calibrator LLM output dim_weights sum={total} (expected 100) — "
+                f"  [WARN] Calibrator output dim_weights sum={total} (expected 100) — "
                 f"resetting to defaults",
                 file=sys.stderr,
             )
             self.dim_weights = dict(DEFAULT_DIM_WEIGHTS)
 
         return self
+
+
+# ═════════════════════════════════════════════════════════════
+# Feedback fidelity check — zero-token signal functions
+# ═════════════════════════════════════════════════════════════
+#
+# Each feedback row is evaluated across 4 independent signals to estimate
+# P(this feedback reflects genuine user preference | observable evidence).
+# Low-fidelity rows (< _FIDELITY_DROP) are discarded before Calibrator sees
+# them, preventing noise-driven parameter drift (RSIR self-consuming collapse).
+#
+# Design doc: docs/FEEDBACK_FIDELITY_DESIGN.md
+
+_FIDELITY_DROP = 0.30        # Below this → discard (likely noise)
+_FIDELITY_MEDIUM = 0.60      # Below this → keep but mark medium-confidence
+
+# ── Sentiment constants — single source of truth ──
+# Shared by _aggregate_feedback (producer) and _signal_ai_feedback_consistency
+# (consumer).  Changing these strings in one place updates both.
+_SENTIMENT_UP = "👍偏好"
+_SENTIMENT_DOWN = "👎排斥"
+_SENTIMENT_NEUTRAL = "⚖️中性"
+
+# ── AI label sets for fidelity signals ──
+# These are INTENTIONAL SUBSETS of _VALID_POS_LABELS / _VALID_NEG_LABELS
+# defined in scorer.py.  We only include labels that indicate a *clear* AI
+# quality judgment — weaker labels like "playable_reference", "ai_related",
+# "digest_rerun", "generic_pr" are excluded because they don't provide a
+# strong enough signal for the fidelity triage.  If you add a label to
+# scorer.py that represents a clear quality judgment, add it here too.
+_AI_POSITIVE_LABELS: frozenset[str] = frozenset({
+    "track_direct", "high_info_density", "exclusive_scoop", "overseas_insight",
+})
+_AI_NEGATIVE_LABELS: frozenset[str] = frozenset({
+    "off_track", "no_gameplay", "low_info", "stale",
+})
+
+
+def _signal_ai_feedback_consistency(row: dict[str, Any]) -> float:
+    """40% weight — agreement between two independent systems (AI + user).
+
+    Key insight: AI and user are independent judges of the same news item.
+    Agreement → strong evidence of genuine quality (or genuine poor quality).
+    Disagreement → still valuable (may reveal AI blindspots) but less certain.
+    No AI labels → weakest signal (no reference point to cross-check).
+    """
+    pos = (row.get("pos_label") or "").strip()
+    neg = (row.get("neg_label") or "").strip()
+    sentiment = row.get("sentiment", "")
+
+    ai_positive = pos in _AI_POSITIVE_LABELS
+    ai_negative = neg in _AI_NEGATIVE_LABELS
+    user_positive = sentiment == _SENTIMENT_UP
+    user_negative = sentiment == _SENTIMENT_DOWN
+
+    # Strong agreement: AI + user independently confirm each other
+    if ai_positive and user_positive:
+        return 1.0
+    if ai_negative and user_negative:
+        return 0.85  # slightly weaker: users 👎 less consistently than 👍
+
+    # Disagreement: AI and user contradict.  This is NOT noise — it's the
+    # most valuable signal for Calibrator to analyze (potential AI blindspot
+    # or user misunderstanding).  But fidelity is medium — we can't be sure
+    # which side is right without deeper analysis.
+    if (ai_positive and user_negative) or (ai_negative and user_positive):
+        return 0.40
+
+    # AI has an opinion but user is neutral
+    if (ai_positive or ai_negative) and sentiment == _SENTIMENT_NEUTRAL:
+        return 0.25
+
+    # No AI labels → no reference point to triangulate
+    return 0.15
+
+
+def _signal_feedback_concentration(row: dict[str, Any]) -> float:
+    """30% weight — participation depth, moderated by consensus clarity.
+
+    A single 👍 (total=1) is an anecdote, not evidence — depth guards that.
+    But high participation with a 3-2 split (5 voters, ratio=0.2) is MORE
+    informative than a 2-0 sweep (2 voters, ratio=1.0).  The formula
+    `depth * (0.5 + 0.5*ratio)` ensures that more voters → higher score,
+    with unanimous consensus adding at most a 2× bonus over a 50/50 split.
+    """
+    up = int(row.get("up", 0))
+    down = int(row.get("down", 0))
+    total = up + down
+    if total == 0:
+        return 0.0
+
+    # How unanimous?  0 = evenly split, 1 = all agree
+    ratio = abs(up - down) / total
+
+    # Participation depth — maps total→[0,1]
+    if total >= 5:
+        depth = 1.0
+    elif total >= 3:
+        depth = 0.75
+    elif total >= 2:
+        depth = 0.40
+    else:
+        depth = 0.15   # single-user anecdote
+
+    # Blend: depth dominates, ratio provides a ±50% modulation.
+    # 5 voters 3-2 (ratio=0.2, depth=1.0) → 0.60  >  2 voters 2-0 (ratio=1.0, depth=0.40) → 0.40
+    # 5 voters 5-0 (ratio=1.0, depth=1.0) → 1.00  >  all others
+    return depth * (0.5 + 0.5 * ratio)
+
+
+def _signal_track_anchor(row: dict[str, Any]) -> float:
+    """20% weight — is the feedback target inside our domain of interest?
+
+    Feedback on track-relevant games (塔防/肉鸽/割草) comes from the target
+    audience whose preferences we're optimizing for.  Feedback on clearly
+    excluded categories is more likely accidental or misaligned.
+    """
+    return 1.0 if row.get("track_relevant") else 0.0
+
+
+def _signal_label_coverage(row: dict[str, Any]) -> float:
+    """10% weight — can we do label×feedback cross-analysis?
+
+    When AI labels exist, Calibrator can pivot: "users 👍 track_direct news
+    but 👎 no_gameplay news".  Without labels, one analysis dimension is lost.
+    """
+    has_label = bool(
+        (row.get("pos_label") or "").strip()
+        or (row.get("neg_label") or "").strip()
+    )
+    return 1.0 if has_label else 0.0
+
+
+def _compute_fidelity(row: dict[str, Any]) -> float:
+    """Estimate P(feedback is genuine preference | observable evidence).
+
+    Pure function — zero token, zero DB access.  Weights are heuristic,
+    calibrated to produce the following reference points:
+
+        Off-track + no label + single anecdote   → ≤0.11  (dropped)
+        Off-track + weak label + single 👍       → ~0.20  (dropped)
+        Track + weak label + single 👍           → ~0.41  (medium)
+        Track + track_direct + 3👍 consensus     → ~0.93  (high)
+        Track + track_direct + 5👍 consensus     →  1.00  (very high)
+    """
+    return round(
+        0.40 * _signal_ai_feedback_consistency(row)
+        + 0.30 * _signal_feedback_concentration(row)
+        + 0.20 * _signal_track_anchor(row)
+        + 0.10 * _signal_label_coverage(row),
+        3,
+    )
 
 
 # ═════════════════════════════════════════════════════════════
@@ -118,7 +301,10 @@ def _aggregate_feedback(start_date: str, end_date: str) -> list[dict[str, Any]]:
     """Query user_feedback joined with market_news for analysis.
 
     Returns one row per unique news_url, with up/down counts, headline,
-    source, and (when available) the AI score and summary from the report.
+    source, and (when available) the AI labels from the report.
+
+    Rows with fidelity below _FIDELITY_DROP are discarded before returning.
+    Each kept row includes a ``_fidelity`` key for downstream formatting.
 
     Uses user_feedback.news_url as the join key to market_news.url.
     """
@@ -148,15 +334,16 @@ def _aggregate_feedback(start_date: str, end_date: str) -> list[dict[str, Any]]:
         """, (start_date, end_date)).fetchall()
 
         result: list[dict[str, Any]] = []
+        dropped = 0
         for r in rows:
             net = r["up"] - r["down"]
             if net > 0:
-                sentiment = "👍偏好"
+                sentiment = _SENTIMENT_UP
             elif net < 0:
-                sentiment = "👎排斥"
+                sentiment = _SENTIMENT_DOWN
             else:
-                sentiment = "⚖️中性"
-            result.append({
+                sentiment = _SENTIMENT_NEUTRAL
+            row_dict = {
                 "headline": (r["headline"] or r["url"] or "?")[:60],
                 "source": (r["source"] or "?")[:12],
                 "up": r["up"],
@@ -165,31 +352,26 @@ def _aggregate_feedback(start_date: str, end_date: str) -> list[dict[str, Any]]:
                 "track_relevant": bool(r["track_relevant"]),
                 "pos_label": (r["pos_label"] or ""),
                 "neg_label": (r["neg_label"] or ""),
-            })
+            }
+
+            # ── Fidelity gate: discard likely-noise feedback ──
+            fid = _compute_fidelity(row_dict)
+            if fid < _FIDELITY_DROP:
+                dropped += 1
+                continue
+            row_dict["_fidelity"] = fid
+            result.append(row_dict)
+
+        if dropped:
+            print(
+                f"  Fidelity filter: {dropped} low-fidelity feedback row(s) dropped "
+                f"({len(result)} kept)",
+                file=sys.stderr,
+            )
         return result
     except Exception as e:
         print(f"  [WARN] Feedback aggregation failed: {e}", file=sys.stderr)
         return []
-
-
-def _format_feedback_table(feedback: list[dict[str, Any]]) -> str:
-    """Format aggregated feedback as a markdown table for the LLM prompt."""
-    if not feedback:
-        return "（暂无用户反馈数据）"
-
-    lines = [
-        "| 来源 | 👍 | 👎 | 倾向 | 赛道 | +标签 | -标签 | 新闻标题 |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for f in feedback:
-        track = "🏷️" if f["track_relevant"] else ""
-        pos = f.get("pos_label", "") or ""
-        neg = f.get("neg_label", "") or ""
-        lines.append(
-            f"| {f['source']} | {f['up']} | {f['down']} "
-            f"| {f['sentiment']} | {track} | {pos} | {neg} | {f['headline']} |"
-        )
-    return "\n".join(lines)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -207,7 +389,8 @@ def _load_params_base() -> dict[str, Any] | None:
         from src.storage.sqlite import get_db
         db = get_db()
         return db.get_latest_calibration_params()
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] _load_params_base failed: {e}", file=sys.stderr)
         return None
 
 
@@ -229,15 +412,214 @@ def _load_current_params() -> dict[str, Any]:
     }
 
 
-def _format_params_for_prompt(params: dict[str, Any]) -> str:
-    """Format current params as human-readable text for the LLM prompt."""
-    topic_str = json.dumps(params.get("topic_boosts", {}), ensure_ascii=False)
-    dim_str = json.dumps(params.get("dim_weights", {}), ensure_ascii=False)
-    return (
-        f"topic_boosts: {topic_str}\n"
-        f"dim_weights: {dim_str}\n"
-        f"当前版本: v{params.get('version', 0)}\n"
-        f"上次校准摘要: {params.get('summary', '无')}"
+# ═════════════════════════════════════════════════════════════
+# Rule engine — zero-token feedback analysis (RED-3)
+# ═════════════════════════════════════════════════════════════
+#
+# Replaces the LLM call that previously analyzed the feedback table.
+# The decision rules in prompts/calibrator.yaml have been translated
+# to pure Python — every threshold and constraint is preserved.
+#
+# The rule engine produces the same CalibratorOutput schema as the
+# LLM did, so downstream persistence and scorer integration are
+# completely unchanged.
+
+_MIN_EVIDENCE_UP = 5       # ≥5 👍 on same topic → positive boost
+_MIN_EVIDENCE_DOWN = 3     # ≥3 👎 on same topic → negative boost
+_MAX_DIM_DELTA = 15        # Single dim_weight adjustment cap
+_DIM_MIN = 10              # Floor for any single dimension
+_DIM_MAX = 70              # Ceiling for any single dimension
+
+
+def _match_topic(headline: str, topic: str) -> bool:
+    """Check whether *headline* contains any keyword for *topic*."""
+    keywords = TOPIC_KEYWORD_MAP.get(topic, [])
+    if not keywords:
+        return False
+    return any(kw.lower() in headline.lower() for kw in keywords)
+
+
+def _analyze_feedback_rules(
+    feedback: list[dict[str, Any]],
+    current_params: dict[str, Any],
+    total_feedback: int,
+    unique_news: int,
+    verbose: bool = False,
+) -> "CalibratorOutput":
+    """Analyze aggregated feedback with a pure rule engine (zero LLM tokens).
+
+    Args:
+        feedback:       Aggregated rows from ``_aggregate_feedback()``.
+        current_params: Latest calibration params (or bootstrapped defaults).
+        total_feedback: Sum of up+down across all rows.
+        unique_news:    Number of unique news URLs.
+        verbose:        Log decisions to stderr.
+
+    Returns:
+        ``CalibratorOutput`` with topic_boosts, dim_weights, findings, summary.
+    """
+    prev_topic_boosts: dict[str, int] = current_params.get("topic_boosts", {})
+    prev_dim_weights: dict[str, int] = current_params.get(
+        "dim_weights", dict(DEFAULT_DIM_WEIGHTS)
+    )
+
+    # ── Phase A: topic_boosts from headline keyword matching ──
+    topic_boosts: dict[str, int] = {}
+    topic_evidence: dict[str, dict[str, int]] = {}
+
+    for topic in ALLOWED_TOPIC_KEYS:
+        matched = [f for f in feedback if _match_topic(f.get("headline", ""), topic)]
+        if not matched:
+            continue
+        up = sum(f["up"] for f in matched)
+        down = sum(f["down"] for f in matched)
+        net = up - down
+
+        topic_evidence[topic] = {"up": up, "down": down, "count": len(matched)}
+
+        boost = 0
+        if down >= _MIN_EVIDENCE_DOWN and net < 0:
+            boost = max(-20, -10 - (down - _MIN_EVIDENCE_DOWN) * 2)
+        elif up >= _MIN_EVIDENCE_UP and net > 0:
+            boost = min(20, 5 + (up - _MIN_EVIDENCE_UP) * 2)
+
+        if boost != 0:
+            topic_boosts[topic] = boost
+
+    # ── Merge with previous topic_boosts (decay absent topics) ──
+    for topic, prev_val in prev_topic_boosts.items():
+        if topic not in topic_boosts:
+            if prev_val > 0:
+                decayed = prev_val // 2
+                if decayed > 0:
+                    topic_boosts[topic] = decayed
+
+    # ── Phase B: dim_weights from label × sentiment analysis ──
+    track_rows = [f for f in feedback if f.get("track_relevant")]
+    track_up = sum(f["up"] for f in track_rows)
+    track_down = sum(f["down"] for f in track_rows)
+    track_net = track_up - track_down
+
+    density_rows = [
+        f for f in feedback
+        if "high_info_density" in (f.get("pos_label") or "")
+        or "low_info" in (f.get("neg_label") or "")
+    ]
+    density_up = sum(f["up"] for f in density_rows)
+    density_down = sum(f["down"] for f in density_rows)
+    density_net = density_up - density_down
+
+    insight_rows = [
+        f for f in feedback
+        if "overseas_insight" in (f.get("pos_label") or "")
+        or "exclusive_scoop" in (f.get("pos_label") or "")
+    ]
+    insight_up = sum(f["up"] for f in insight_rows)
+    insight_down = sum(f["down"] for f in insight_rows)
+    insight_net = insight_up - insight_down
+
+    dim_signals = [
+        ("track", track_net, prev_dim_weights.get("track", 40)),
+        ("density", density_net, prev_dim_weights.get("density", 40)),
+        ("insight", insight_net, prev_dim_weights.get("insight", 20)),
+    ]
+
+    new_dim_weights: dict[str, int] = {}
+    dim_deltas: dict[str, int] = {}
+    for dim, net, prev_val in dim_signals:
+        if net >= 3:
+            delta = min(_MAX_DIM_DELTA, 5 + (net - 3))
+        elif net <= -3:
+            delta = max(-_MAX_DIM_DELTA, -5 - (abs(net) - 3))
+        else:
+            delta = 0
+
+        new_val = prev_val + delta
+        new_val = max(_DIM_MIN, min(_DIM_MAX, new_val))
+        new_dim_weights[dim] = new_val
+        dim_deltas[dim] = delta
+
+    # Normalize to sum=100
+    total_w = sum(new_dim_weights.values())
+    if total_w != 100:
+        scaled = {k: round(v * 100 / total_w) for k, v in new_dim_weights.items()}
+        diff = 100 - sum(scaled.values())
+        largest_dim = max(scaled, key=scaled.get)  # type: ignore[arg-type]
+        scaled[largest_dim] += diff
+        new_dim_weights = scaled
+
+    # ── Phase C: findings ──
+    findings: list[CalibratorFinding] = []
+
+    for topic in sorted(topic_boosts, key=lambda t: abs(topic_boosts[t]), reverse=True):
+        boost = topic_boosts[topic]
+        ev = topic_evidence.get(topic, {"up": 0, "down": 0, "count": 0})
+        evidence_count = ev["count"]
+        if boost > 0:
+            pattern = f"{topic}话题报道持续获用户好评（{ev['up']}👍 / {ev['down']}👎）"
+            action = f"topic_boosts.{topic} +{boost}"
+            confidence = "high" if ev["up"] >= _MIN_EVIDENCE_UP + 2 else "medium"
+        else:
+            pattern = f"{topic}话题报道持续受用户排斥（{ev['up']}👍 / {ev['down']}👎）"
+            action = f"topic_boosts.{topic} {boost}"
+            confidence = "high" if ev["down"] >= _MIN_EVIDENCE_DOWN + 2 else "medium"
+        findings.append(CalibratorFinding(
+            pattern=pattern,
+            evidence_count=evidence_count,
+            action=action,
+            confidence=confidence,
+        ))
+
+    for dim in ("track", "density", "insight"):
+        delta = dim_deltas.get(dim, 0)
+        if delta != 0:
+            prev_val = prev_dim_weights.get(dim, DEFAULT_DIM_WEIGHTS[dim])
+            new_val = new_dim_weights[dim]
+            direction = "正向" if delta > 0 else "负向"
+            findings.append(CalibratorFinding(
+                pattern=f"{dim}维度用户反馈净{direction}（净{'+' if delta > 0 else ''}{delta}），调整权重",
+                evidence_count=abs(delta),
+                action=f"dim_weights.{dim} {prev_val}→{new_val}",
+                confidence="medium",
+            ))
+
+    # ── Phase D: summary ──
+    topic_lines: list[str] = []
+    for topic in sorted(topic_boosts, key=lambda t: abs(topic_boosts[t]), reverse=True):
+        boost = topic_boosts[topic]
+        topic_lines.append(f"  - {topic}: {'+' if boost > 0 else ''}{boost}")
+
+    dim_lines: list[str] = []
+    for dim in ("track", "density", "insight"):
+        pv = prev_dim_weights.get(dim, DEFAULT_DIM_WEIGHTS[dim])
+        nv = new_dim_weights[dim]
+        if pv != nv:
+            dim_lines.append(f"  - {dim}: {pv}→{nv}")
+        else:
+            dim_lines.append(f"  - {dim}: {nv} (未调整)")
+
+    summary = (
+        f"规则引擎校准（{total_feedback}条反馈，{unique_news}条新闻）。\n"
+        f"topic_boosts 调整：\n"
+        + ("\n".join(topic_lines) if topic_lines else "  （无显著信号）")
+        + f"\ndim_weights 调整：\n"
+        + "\n".join(dim_lines)
+        + f"\n调整规则：👍≥{_MIN_EVIDENCE_UP}次正向加成，👎≥{_MIN_EVIDENCE_DOWN}次负向惩罚，"
+        f"维度权重单次调整≤±{_MAX_DIM_DELTA}%。"
+    )
+
+    if verbose:
+        if topic_boosts:
+            print(f"  [rules] topic_boosts: {topic_boosts}", file=sys.stderr)
+        else:
+            print("  [rules] topic_boosts: (no significant signal)", file=sys.stderr)
+        print(f"  [rules] dim_weights: {new_dim_weights}", file=sys.stderr)
+
+    return CalibratorOutput(
+        topic_boosts=topic_boosts,
+        dim_weights=new_dim_weights,
+        findings=findings,
+        summary=summary,
     )
 
 
@@ -255,7 +637,7 @@ def run_calibrator(
     force: bool = False,
     verbose: bool = False,
 ) -> dict[str, Any]:
-    """Run the Calibrator: aggregate feedback → LLM analysis → persist params.
+    """Run the Calibrator: aggregate feedback → rule analysis → persist params.
 
     Args:
         start_date:  Start of feedback window (YYYY-MM-DD).  Computed from
@@ -290,11 +672,22 @@ def run_calibrator(
     if verbose:
         print(f"  Aggregated {total_feedback} feedback items across {unique_news} news articles",
               file=sys.stderr)
+        medium_count = sum(
+            1 for f in feedback
+            if f.get("_fidelity", 1.0) < _FIDELITY_MEDIUM
+        )
+        if medium_count:
+            print(
+                f"    ({medium_count} item(s) marked medium-confidence, "
+                f"fidelity < {_FIDELITY_MEDIUM})",
+                file=sys.stderr,
+            )
 
     # ── Gate: insufficient data ──
     if total_feedback < _MIN_FEEDBACK_THRESHOLD and not force:
         msg = (
-            f"仅 {total_feedback} 条反馈，不足 {_MIN_FEEDBACK_THRESHOLD} 条阈值。"
+            f"仅 {total_feedback} 条高信度反馈（经保真度过滤），"
+            f"不足 {_MIN_FEEDBACK_THRESHOLD} 条阈值。"
             f"跳过校准。使用 --force 强制运行。"
         )
         if verbose:
@@ -311,34 +704,21 @@ def run_calibrator(
     if verbose:
         print(f"  Current params: v{current_params['version']}", file=sys.stderr)
 
-    # ── Step 3: LLM analysis ──
-    from src.agents.base import Agent
-
-    agent = Agent(
-        "calibrator",
-        tools=None,
-        model=None,
-        max_tool_rounds=1,
-        max_tokens=8192,
-        output_schema=CalibratorOutput,
-    )
-
+    # ── Step 3: Rule engine analysis (zero LLM tokens) ──
     try:
-        result = agent.run(
-            feedback_days=days,
-            feedback_table=_format_feedback_table(feedback),
-            current_params=_format_params_for_prompt(current_params),
-            start_date=start_date,
-            end_date=end_date,
+        calib_output = _analyze_feedback_rules(
+            feedback=feedback,
+            current_params=current_params,
             total_feedback=total_feedback,
             unique_news=unique_news,
-            _verbose=False,
+            verbose=verbose,
         )
+        result = calib_output.model_dump()
     except Exception as e:
-        print(f"  [ERROR] Calibrator LLM call failed: {e}", file=sys.stderr)
+        print(f"  [ERROR] Calibrator rule engine failed: {e}", file=sys.stderr)
         return {
             "skipped": True,
-            "reason": f"LLM调用失败: {e}",
+            "reason": f"规则引擎异常: {e}",
             "total_feedback_count": total_feedback,
             "unique_news": unique_news,
         }
@@ -412,8 +792,8 @@ def load_calibration_for_scorer() -> dict[str, Any]:
         if not latest.get("applied"):
             from src.storage.sqlite import get_db
             get_db().mark_calibration_applied(latest["version"])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [WARN] mark_calibration_applied failed: {e}", file=sys.stderr)
     return {
         "topic_boosts": latest["topic_boosts"],
         "dim_weights": latest["dim_weights"],

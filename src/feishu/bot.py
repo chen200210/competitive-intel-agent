@@ -51,8 +51,8 @@ def _handle_card_action(event_obj: Any) -> None:
                 # Feishu sometimes double-encodes: parse again if still a string
                 if isinstance(action_value, str):
                     action_value = json.loads(action_value)
-            except Exception:
-                print(f"[CARD_ACTION] Failed to parse action_value JSON")
+            except Exception as e:
+                print(f"[CARD_ACTION] Failed to parse action_value JSON: {e}")
                 return
 
         if not isinstance(action_value, dict):
@@ -215,10 +215,9 @@ def _get_user_name(open_id: str) -> str:
             if name:
                 _name_cache[open_id] = name
                 return name
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Failed to look up user name for {open_id[:12]}: {e}", file=sys.stderr)
         pass
-
-    # Fallback: truncated open_id
     fallback = f"用户{open_id[:6]}"
     _name_cache[open_id] = fallback
     return fallback

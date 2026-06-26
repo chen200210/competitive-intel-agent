@@ -80,7 +80,8 @@ def fetch_article_body(url: str, timeout: int = 10) -> str:
         excerpt = " ".join(lines[:12])  # ~12 lines ≈ 500 chars
 
         return excerpt[:800]  # cap at 800 chars
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] fetch_article_body failed for {url[:80]}: {e}", file=sys.stderr)
         return ""
 
 
@@ -108,7 +109,8 @@ def is_image_too_small(image_url: str, min_dim: int = 200, min_kb: int = 5) -> b
         # If content-length header says < 3KB, definitely an icon
         if content_length and content_length < 3000:
             return True
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] HEAD request failed for {image_url[:80]}: {e}", file=sys.stderr)
         pass  # HEAD failed, try GET instead
 
     try:
@@ -125,7 +127,8 @@ def is_image_too_small(image_url: str, min_dim: int = 200, min_kb: int = 5) -> b
         w, h = img.width, img.height
         if w < min_dim or h < min_dim:
             return True
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Image size check failed for {image_url[:80]}: {e}", file=sys.stderr)
         return False  # can't determine, assume OK
 
     return False

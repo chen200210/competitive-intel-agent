@@ -29,8 +29,12 @@ Thumbs.db
 .claude/
 data/raw/ 
 data/.diandian_charts.json 
-data/processed/ 
-article.json 
-data/.diandian_charts.json 
-data/processed/ 
-article.json 
+data/processed/
+article.json
+data/.bilibili_chrome_profile/
+data/.taptap_track.json
+data/bilibili_debug.png
+data/taptap_search_test.html
+taptap_search.png
+parse_taptap.py
+parse_taptap2.py

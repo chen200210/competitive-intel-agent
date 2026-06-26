@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from datetime import date as _date
 from typing import Any
 
@@ -320,7 +321,8 @@ def web_search(query: str, max_results: int = 5, **_meta: Any) -> str:
                     {"query": query, "results": cached, "engine": "cache", "cache_hit": True},
                     ensure_ascii=False,
                 )
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] search cache lookup failed: {e}", file=sys.stderr)
         pass
 
     # ── Real search: try engines in order ──
@@ -371,7 +373,8 @@ def web_search(query: str, max_results: int = 5, **_meta: Any) -> str:
             result_count=len(parsed.get("results", [])),
             called_by=called_by,
         )
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] search cache write failed: {e}", file=sys.stderr)
         pass
 
     return json.dumps(parsed, ensure_ascii=False)

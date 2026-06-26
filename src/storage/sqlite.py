@@ -11,6 +11,7 @@ Schema v2: UNIQUE(date, platform, chart_type, bundle_id)
 
 import sqlite3
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -262,6 +263,8 @@ CREATE TABLE IF NOT EXISTS hot_topic_news (
     snippet TEXT DEFAULT '',
     search_engine TEXT DEFAULT '',     -- 'ddg' | '360' | 'sogou' | 'bing'
     selected BOOLEAN DEFAULT 0,       -- whether selected for daily card
+    ai_summary TEXT DEFAULT '',        -- AI-generated 1-2 sentence summary
+    value_score INTEGER DEFAULT 0,    -- 0-100 business value score from Agent
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(date, url)
 );
@@ -307,6 +310,7 @@ class Database:
         self._migrate_v9()
         self._migrate_v10()
         self._migrate_v11()
+        self._migrate_v12()
 
     # ── Connection ──────────────────────────────────────────
 
@@ -544,6 +548,18 @@ class Database:
             if "neg_label" not in existing:
                 conn.execute("ALTER TABLE market_news ADD COLUMN neg_label TEXT DEFAULT ''")
                 print("[migrate] Added neg_label column to market_news")
+
+    def _migrate_v12(self) -> None:
+        """Add ai_summary / value_score columns to hot_topic_news for Agent output."""
+        with self._connect() as conn:
+            existing = {row[1] for row in conn.execute(
+                "PRAGMA table_info('hot_topic_news')").fetchall()}
+            if "ai_summary" not in existing:
+                conn.execute("ALTER TABLE hot_topic_news ADD COLUMN ai_summary TEXT DEFAULT ''")
+                print("[migrate] Added ai_summary to hot_topic_news")
+            if "value_score" not in existing:
+                conn.execute("ALTER TABLE hot_topic_news ADD COLUMN value_score INTEGER DEFAULT 0")
+                print("[migrate] Added value_score to hot_topic_news")
 
     # ── Calibration CRUD ─────────────────────────────────────
 
@@ -922,7 +938,6 @@ class Database:
                 ).fetchall()
             existing_urls = {r["url"] for r in rows if r["url"]}
         except Exception as e:
-            import sys
             print(f"  [WARN] Failed to load existing URLs for dedup: {e}", file=sys.stderr)
 
         # ── Filter out duplicates ──
@@ -1139,8 +1154,9 @@ class Database:
                     f"UPDATE market_news SET {col} = {col} + 1 WHERE url = ? AND date = ?",
                     (url, date),
                 )
-            except Exception:
-                pass  # market_news row might not exist (post-cleanup re-run)
+            except Exception as e:
+                print(f"  [WARN] market_news counter update failed (row may not exist): {e}", file=sys.stderr)
+                # market_news row might not exist (post-cleanup re-run)
 
             # ── Atomic insert with dedup (UNIQUE constraint on news_url+open_id) ──
             try:
@@ -1153,7 +1169,8 @@ class Database:
                 if cur.rowcount == 0:
                     return "duplicate"
                 return "inserted"
-            except Exception:
+            except Exception as e:
+                print(f"  [WARN] user_feedback INSERT failed for {url}: {e}", file=sys.stderr)
                 return "error"
 
     # ── Utility ─────────────────────────────────────────────
@@ -1297,8 +1314,9 @@ class Database:
                     (date, phases_json, exit_code, error_summary, total_ms),
                 )
                 conn.commit()
-        except Exception:
-            pass  # best-effort — never let monitoring break the pipeline
+        except Exception as e:
+            print(f"  [WARN] insert_pipeline_run failed: {e}", file=sys.stderr)
+            # best-effort — never let monitoring break the pipeline
 
 
 # ── Module-level convenience ─────────────────────────────────

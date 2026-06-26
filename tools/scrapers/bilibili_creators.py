@@ -41,7 +41,7 @@ DEFAULT_CREATORS_YAML = PROJECT_ROOT / "data" / "bilibili_creators.yaml"
 # ── Scraping parameters ──
 MAX_FALLBACK_VIDEOS = 2         # When no videos in date range, take this many latest
 MAX_PAGES = 3                   # Max pages of space API to paginate through (30 vids/page)
-PAGE_TIMEOUT = 30_000           # ms
+PAGE_TIMEOUT = 60_000           # ms (B站space页很重，30s经常不够)
 API_WAIT_TIMEOUT = 15_000       # ms for initial API response
 SCROLL_PAUSE = 2_000            # ms between scrolls for lazy loading
 
@@ -222,17 +222,31 @@ class BilibiliCreatorScraper:
                             vlist = data.get("list", {}).get("vlist", [])
                             if vlist:
                                 api_data.extend(vlist)
-                    except Exception:
+                    except Exception as e:
+                        print(f"  [WARN] B站API响应解析失败: {e}", file=sys.stderr)
                         pass
 
             page.on("response", _on_response)
 
             # ── Navigate to space page ──
-            page.goto(
-                f"https://space.bilibili.com/{uid}",
-                wait_until="networkidle",
-                timeout=PAGE_TIMEOUT,
-            )
+            # B站space页面非常重（动态+反爬），networkidle经常超时。
+            # 用domcontentloaded — API拦截器在goto前已注册，能捕获所有异步请求。
+            url = f"https://space.bilibili.com/{uid}"
+            for attempt in range(2):
+                try:
+                    page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=PAGE_TIMEOUT,
+                    )
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        print(f"   [retry] page.goto for {label} timed out: {e}", file=sys.stderr)
+                        continue
+                    raise
+
+            # 给异步API请求足够时间返回（domcontentloaded后JS刚开始执行）
 
             page.wait_for_timeout(API_WAIT_TIMEOUT)
 
@@ -344,13 +358,15 @@ class BilibiliCreatorScraper:
                                 v["ai_subtitle"] = self._fetch_ai_subtitle(
                                     client, aid, cid, bvid
                                 )
-                            except Exception:
+                            except Exception as e:
+                                print(f"  [WARN] AI字幕获取失败 {bvid}: {e}", file=sys.stderr)
                                 v["ai_subtitle"] = ""
 
                         # ── Tags ──
                         try:
                             v["tags"] = self._fetch_tags(client, bvid)
-                        except Exception:
+                        except Exception as e:
+                            print(f"  [WARN] 标签获取失败 {bvid}: {e}", file=sys.stderr)
                             v["tags"] = ""
 
                     else:
@@ -441,7 +457,8 @@ class BilibiliCreatorScraper:
             if created_ts:
                 try:
                     created_str = datetime.fromtimestamp(created_ts).strftime("%Y-%m-%d %H:%M")
-                except Exception:
+                except Exception as e:
+                    print(f"  [WARN] timestamp格式转换失败 ({created_ts}): {e}", file=sys.stderr)
                     created_str = str(created_ts)
 
             videos.append({
@@ -508,7 +525,8 @@ class BilibiliCreatorScraper:
                                 if ta and len(ta) > 10 and ta != title:
                                     title = ta
                                     break
-                        except Exception:
+                        except Exception as e:
+                            print(f"  [WARN] DOM父元素定位失败: {e}", file=sys.stderr)
                             pass
                         if title and len(title) > 5:
                             break
