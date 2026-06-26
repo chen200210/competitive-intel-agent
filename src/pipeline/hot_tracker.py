@@ -3,8 +3,8 @@ Hot topic tracking — Phase 0.5 (keyword collection) + Phase 1.5 (news search).
 
 Phase 0.5: Collect hot keywords from Baidu/Zhihu + curated interests,
            apply feedback-based weight adjustment → hot_keywords table.
-Phase 1.5: Search game-related news for each keyword (360-first,
-           fallback Sogou→Bing) → hot_topic_news table.
+Phase 1.5: Search game-related news for each keyword (360-news first,
+           fallback Sogou-news) → hot_topic_news table.
 
 Usage:
     from src.pipeline.hot_tracker import collect_hot_keywords, search_hot_topics
@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 from src.storage.sqlite import get_db
 from src.agents.base import Agent, Tool
-from src.tools.web_search import _scrape_360, _scrape_sogou
+from src.tools.web_search import _scrape_360_news, _scrape_sogou_news
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -550,14 +550,14 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
 
 
 def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """Search with 360-first fallback chain. Returns results with search_engine tag.
+    """Search with 360-news-first fallback chain. Returns results with search_engine tag.
 
     DDG removed from chain (html.duckduckgo.com returns 202 with no results even
     with VPN — confirmed 2026-06-26). 360/Sogou handle Chinese game queries well.
     """
     engines: list[tuple[str, Any]] = [
-        ("360", _scrape_360),
-        ("sogou", _scrape_sogou),
+        ("360-news", _scrape_360_news),
+        ("sogou-news", _scrape_sogou_news),
     ]
 
     for engine_name, engine_fn in engines:

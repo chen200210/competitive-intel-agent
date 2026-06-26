@@ -196,6 +196,138 @@ def _scrape_sogou(query: str, max_results: int = 5) -> str:
 
     return json.dumps({"query": query, "results": results, "engine": "sogou"}, ensure_ascii=False)
 
+
+
+# ── 360 News Search ────────────────────────────────────────────
+
+def _scrape_360_news(query: str, max_results: int = 5) -> str:
+    """Scrape 360 News Search (news.so.com) — returns recent news, not SEO pages.
+
+    Unlike web search which returns stale listicles, news.so.com returns
+    results from hours/days ago with timestamps like "4小时前" / "1天前".
+    """
+    resp = httpx.get(
+        "https://news.so.com/ns",
+        params={"q": query, "src": "srp"},
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: list[dict[str, str]] = []
+
+    # 360 news results are in <li> elements
+    for li in soup.select("li"):
+        a = li.select_one("h3 a") or li.select_one("a")
+        if not a:
+            continue
+        title = a.get_text(strip=True)
+        if len(title) < 10:
+            continue
+        href = a.get("href", "")
+
+        # Extract time (e.g. "4小时前", "1天前", "2026-05-28")
+        time_str = ""
+        for sel in ["[class*='time']", ".date", ".source", "span:last-child"]:
+            time_el = li.select_one(sel)
+            if time_el:
+                time_str = time_el.get_text(strip=True)
+                break
+
+        # Extract snippet from any paragraph
+        snippet = ""
+        for sel in ["p", ".desc", ".summary"]:
+            p_el = li.select_one(sel)
+            if p_el:
+                snippet = p_el.get_text(strip=True)[:300]
+                break
+
+        # Combine title with time for context
+        if time_str and time_str not in title:
+            title = f"{title} ({time_str})"
+
+        results.append({
+            "title": title,
+            "url": href,
+            "snippet": snippet,
+        })
+
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        return json.dumps(
+            {"query": query, "results": [], "engine": "360-news",
+             "note": "No news results found."},
+            ensure_ascii=False,
+        )
+
+    return json.dumps({"query": query, "results": results, "engine": "360-news"}, ensure_ascii=False)
+
+
+# ── Sogou News Search ──────────────────────────────────────────
+
+def _scrape_sogou_news(query: str, max_results: int = 5) -> str:
+    """Scrape Sogou News Search (news.sogou.com) — time-sorted news results.
+
+    Uses sort=1 (by time) for freshest results first.
+    Includes a small delay to avoid rate-limiting.
+    """
+    import time
+    time.sleep(0.5)  # anti-rate-limit
+
+    resp = httpx.get(
+        "https://news.sogou.com/news",
+        params={"query": query, "sort": 1},
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results: list[dict[str, str]] = []
+
+    # Sogou news results: div.results > div.vrwrap > div.news200616
+    for item in soup.select("div.results div.vrwrap")[:max_results]:
+        title_el = item.select_one("h3.vr-title a") or item.select_one("h3 a")
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+        if href.startswith("/"):
+            href = f"https://news.sogou.com{href}"
+
+        # Get full text for snippet (includes source + date + summary)
+        text = item.get_text(strip=True)
+        # Remove the title from text to avoid duplication
+        if text.startswith(title):
+            text = text[len(title):].strip()
+        snippet = text[:300]
+
+        if title:
+            results.append({
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+            })
+
+    if not results:
+        return json.dumps(
+            {"query": query, "results": [], "engine": "sogou-news",
+             "note": "No news results found."},
+            ensure_ascii=False,
+        )
+
+    return json.dumps({"query": query, "results": results, "engine": "sogou-news"}, ensure_ascii=False)
 # ── Main entry ─────────────────────────────────────────────────
 
 def web_search(query: str, max_results: int = 5, **_meta: Any) -> str:
