@@ -353,20 +353,49 @@ Step 5 — 输出 JSON
 
 **RecGPT 做法**：`ŷ = β·ŷ_col + (1-β)·ŷ_sem`，β=0.5 在推荐场景平衡协同与语义。
 
-**我们的做法**：代码层 `_compute_signal_score()` 从正文长度/数据点/新鲜度/是否汇总四个维度算出 0-100 分数，融合 `0.3 × signal + 0.7 × ai`。
+**映射关系**（这是理解的关键）：
 
-**文件**：`src/agents/scorer.py`（`_compute_signal_score` + β-融合常量 + 硬约束封顶）
+RecGPT 的公式里有两个分数来源——传统的协同过滤（ŷ_col）和新的 LLM 语义（ŷ_sem）。我们的系统里也有两个分数来源——传统的代码规则（signal_score）和新的 LLM 打分（ai_score）：
+
+| RecGPT 符号 | RecGPT 含义 | 我们的对应 | 我们的含义 |
+|:---------:|----------|--------|------|
+| ŷ_col | 协同过滤分数（传统方法，靠用户行为 ID 相似度） | signal_score | 代码规则分数（传统方法，靠正则提取正文长度/数据点/新鲜度） |
+| β | 传统方法的权重 = 0.5 | 0.3 | 传统方法的权重 = 0.3 |
+| ŷ_sem | LLM 语义分数（新方法，靠标签理解商品内容） | ai_score | LLM 打分（新方法，靠 AI 理解新闻内容价值） |
+| 1-β | LLM 的权重 = 0.5 | 0.7 | LLM 的权重 = 0.7 |
+
+**为什么我们的 β 比 RecGPT 小**：
+
+RecGPT 的 ŷ_col 是协同过滤——淘宝打磨了十年的推荐算法，非常可靠，所以给它 50% 权重。我们的 signal_score 是代码规则——看正文长度够不够、有没有数据点、是不是昨天发的。这些规则只能做**粗筛**，不知道"独立游戏深度报道"比"大厂公关稿"更有价值。所以代码只占 30%，AI 占 70%。
+
+但 0.3 不是摆设——它做**兜底**。举个实际例子：
+
+```
+空洞通稿：body_len=0, fact_count=0, freshness="未标注", is_digest=false
+  → signal_score = 40 - 15 - 10 - 0 + 0 = 15 分
+  → AI 误打了 75 分
+  → fused = 0.3 × 15 + 0.7 × 75 = 4.5 + 52.5 = 57 分 ✅ 被拉回合理区间
+
+深度报道：body_len=500+, fact_count=8, freshness="今日", is_digest=false
+  → signal_score = 40 + 5 + 10 + 0 + 10 = 65 分
+  → AI 打了 72 分
+  → fused = 0.3 × 65 + 0.7 × 72 = 19.5 + 50.4 = 70 分 ✅ 两个信号一致，微调
+```
+
+第一个例子是 β-Fusion 的核心价值：**代码信号做锚，防止 LLM 离谱打分**。第二个例子是正常情况——两个信号指向同一方向，融合结果接近原始 AI 分。
+
+**硬约束**：当 `signal_score < 20` 且 `ai_score > 60` 时，融合结果强制封顶 59。这是代码的"否决权"——"正文为空+没有数据点"的新闻，无论 AI 多喜欢，分数不得超过 59。
+
+**文件**：`src/agents/scorer.py`（`_compute_signal_score` + `_BETA=0.3` + `_SIGNAL_FLOOR=20` / `_AI_SOFT_CAP=60`）
 
 **评分流程**：
 ```
 AI raw score (LLM)
-  → β-Fusion (0.3×signal + 0.7×AI)     ← 代码信号做锚
+  → β-Fusion (0.3×signal + 0.7×AI)     ← 代码信号做锚，拉回离谱分
   → topic_boosts (Calibrator 用户偏好)   ← 反馈数据调参
   → 分布检查 + fallback (最终防线)      ← 不可绕过
   → 去重 + 质量门禁 + 来源多样性 → top 7
 ```
-
-**为什么 β=0.3 而非 0.5**：我们的场景比推荐更偏语义判断——"这条新闻对竞品分析有用吗"主要靠 AI 理解内容，代码信号只能做粗筛。0.3 的权重能防止离谱打分（空洞通稿打 75），同时不让代码规则过度主导。
 
 #### 模式 4: LLM as a Judge → Calibrator
 
@@ -396,19 +425,40 @@ python -m src.pipeline.runner --calibrate --calibrate-days 14 -v
 # 之后建议每周跑一次
 ```
 
-#### 模式 5: 离线预计算 → 代码直拼 + 配置缓存
+#### 模式 5: 离线预计算 → 把 LLM 调出热路径
 
 **RecGPT 做法**：推荐解释离线算好存 lookup table，在线查表零延迟。
 
-**我们的做法**：三处 "离线预计算 + 在线直读"：
+**这个模式的核心思想**：区分两类工作——"需要 LLM 但不需要实时"和"根本不需要 LLM"。两类都离线化，让在线路径零 AI 调用。
 
-| 离线 | 在线 | 文件 |
-|------|------|------|
-| Briefer LLM 排版已移除 → 代码直拼 markdown | `brief()` 纯 Python 组装 | `briefer.py` |
-| Calibrator 输出 calibration_params | `load_calibration_for_scorer()` 读 DB | `calibrator.py` / `scorer.py` |
-| 代码信号提取 `_extract_body_signals()` | 注入 prompt + β-fusion 融合 | `scorer.py` |
+RecGPT 的推荐解释是**第一类**（需要 LLM 但不实时）——"为什么推荐这个商品"的判断需要 LLM 理解用户兴趣和商品属性，但不需要在 100ms 内算出来。于是离线预计算所有"兴趣 × 类别 → 解释"组合，存成 lookup table，在线直接查表。
 
-**为什么把 Briefer 的 AI 排版也砍掉**：排版任务的信息量远小于摘要和打分——把已经写好的 7 段摘要拼成 markdown 不需要 LLM 判断。RecGPT 的原则是"LLM 做离线重活，在线走缓存"——排版是纯机械操作，属于应该在在线代码完成的"缓存层"。
+我们的系统有三处应用，覆盖两类：
+
+**第一类："需要 LLM 但不实时"** — Calibrator 参数缓存：
+
+```
+Calibrator（每周跑一次，LLM 分析反馈）
+    → calibration_params 表（版本化，存 DB）
+    → 每天日报：load_calibration_for_scorer() 直接读 DB
+    → apply_topic_boosts() 纯数学运算
+    → 零 LLM 调用
+```
+
+这和 RecGPT 的 lookup table **完全同构**：LLM 离线干活（分析反馈 → 调参），结果持久化（DB 表），在线零成本读取。Calibrator 是离线 LLM，每天跑日报时只读它的输出，不调它。
+
+**第二类："根本不需要 LLM"** — 两类机械操作砍掉：
+
+| 砍掉 | 理由 | 现在怎么做 |
+|------|------|----------|
+| Briefer AI 排版 | 把 7 段已写好的摘要拼成 markdown，纯字符串拼接 | `brief()` 中代码直拼：`sorted_news → md_blocks` |
+| 代码信号提取 | 数字数、找公司名、看日期——正则就能做 | `_extract_body_signals()` 零 token，结果注入 prompt |
+
+这两处砍掉的逻辑是：**LLM 不是免费的**。RecGPT 把 LLM 调出推荐系统的在线路径以节省延迟。我们把 LLM 调出机械性工作以节省 token。原理一样——LLM 只用在它不可替代的地方（语义理解和判断），其他地方用代码。
+
+**结果**：整个日报系统现在只有 **1 个 LLM 调用点**（Summarizer 打分+摘要+标签），其他全部是代码或缓存读取。
+
+**文件**：`src/agents/calibrator.py`（离线 LLM → DB）、`src/agents/scorer.py`（`load_calibration_for_scorer` 在线读 + `_extract_body_signals` 零 token）、`src/agents/briefer.py`（代码直拼 markdown）
 
 ---
 
