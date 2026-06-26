@@ -3,8 +3,8 @@ Hot topic tracking — Phase 0.5 (keyword collection) + Phase 1.5 (news search).
 
 Phase 0.5: Collect hot keywords from Baidu/Zhihu + curated interests,
            apply feedback-based weight adjustment → hot_keywords table.
-Phase 1.5: Search game-related news for each keyword (DDG-first,
-           fallback 360→Sogou→Bing) → hot_topic_news table.
+Phase 1.5: Search game-related news for each keyword (360-first,
+           fallback Sogou→Bing) → hot_topic_news table.
 
 Usage:
     from src.pipeline.hot_tracker import collect_hot_keywords, search_hot_topics
@@ -29,6 +29,8 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
 from src.storage.sqlite import get_db
+from src.agents.base import Agent, Tool
+from src.tools.web_search import _scrape_360, _scrape_sogou, _scrape_bing
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -72,7 +74,8 @@ NON_GAME_SIGNALS: list[str] = [
 def collect_hot_keywords(date: str) -> dict[str, Any]:
     """Collect hot keywords from multiple sources → hot_keywords table.
 
-    Sources: Baidu hot search, Zhihu hot list, curated interest areas.
+    Sources: Baidu hot search, Zhihu hot list, Weibo hot search,
+    Xiaohongshu trending (via search aggregation), curated interest areas.
     Applies feedback-based weight adjustment from user_feedback (hot_click).
 
     Returns:
@@ -88,7 +91,7 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
             all_keywords.extend(baidu_kws)
             sources_used.append("baidu")
     except Exception as e:
-        print(f"  [WARN] Baidu hotspot scrape failed: {e}")
+        print(f"  [WARN] Baidu hotspot scrape failed: {e}", file=sys.stderr)
 
     # ── Source 2: Zhihu hot list ──
     try:
@@ -97,9 +100,30 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
             all_keywords.extend(zhihu_kws)
             sources_used.append("zhihu")
     except Exception as e:
-        print(f"  [WARN] Zhihu hotspot scrape failed: {e}")
+        print(f"  [WARN] Zhihu hotspot scrape failed: {e}", file=sys.stderr)
 
-    # ── Source 3: Curated interests (always available) ──
+    # ── Source 3: Weibo hot search ──
+    try:
+        weibo_kws = _fetch_weibo_hotspots()
+        if weibo_kws:
+            all_keywords.extend(weibo_kws)
+            sources_used.append("weibo")
+    except Exception as e:
+        print(f"  [WARN] Weibo hotspot scrape failed: {e}", file=sys.stderr)
+
+    # ── Source 4: Xiaohongshu trending topics (via search aggregation) ──
+    # XHS is a SPA with no public hot-search API, so we search-aggregate
+    # instead of scraping directly. This catches game topics bubbling on XHS
+    # without needing Playwright. Can be upgraded to a direct API later.
+    try:
+        xhs_kws = _fetch_xiaohongshu_hotspots()
+        if xhs_kws:
+            all_keywords.extend(xhs_kws)
+            sources_used.append("xiaohongshu")
+    except Exception as e:
+        print(f"  [WARN] Xiaohongshu hotspot scrape failed: {e}", file=sys.stderr)
+
+    # ── Source 5: Curated interests (always available) ──
     # Deep-copy each dict to avoid mutating the module-level constant
     all_keywords.extend(dict(kw) for kw in CURATED_KEYWORDS)
     sources_used.append("curated")
@@ -193,7 +217,7 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
         ]
         db.insert_hot_keywords(records)
     except Exception as e:
-        print(f"  [WARN] Failed to write hot keywords to DB: {e}")
+        print(f"  [WARN] Failed to write hot keywords to DB: {e}", file=sys.stderr)
 
     return {
         "keywords": keywords,
@@ -292,6 +316,101 @@ def _fetch_zhihu_hotspots() -> list[dict[str, Any]]:
     return results
 
 
+def _fetch_weibo_hotspots() -> list[dict[str, Any]]:
+    """Scrape Weibo hot search for game/tech topics via public JSON API.
+
+    Endpoint: https://weibo.com/ajax/side/hotSearch (no auth required).
+    Returns up to 30 realtime hot search items, filtered for game relevance.
+    """
+    try:
+        resp = httpx.get(
+            "https://weibo.com/ajax/side/hotSearch",
+            headers={
+                "User-Agent": UA,
+                "Referer": "https://weibo.com/",
+                "Accept": "application/json",
+            },
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"  [WARN] Weibo hotspot scrape failed: {e}", file=sys.stderr)
+        return []
+
+    if not data.get("ok") or "data" not in data:
+        return []
+
+    realtime = data["data"].get("realtime", [])
+    if not realtime:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for item in realtime[:30]:
+        word = (item.get("word") or item.get("word_scheme") or "").strip()
+        if not word or len(word) < 2:
+            continue
+        # Strip hashtag markers for cleaner keyword matching
+        clean = word.strip("#")
+        if not _is_game_relevant(clean):
+            continue
+
+        results.append({
+            "keyword": _normalize_keyword(clean),
+            "source": "weibo",
+            "rank": item.get("realpos", len(results) + 1),
+        })
+
+    return results
+
+
+def _fetch_xiaohongshu_hotspots() -> list[dict[str, Any]]:
+    """Discover game-related trending topics on Xiaohongshu via search aggregation.
+
+    XHS is a JS-rendered SPA with no public hot-search API. Instead of expensive
+    Playwright scraping, we search "小红书 游戏 热门话题" through the existing
+    engine chain and extract game-relevant keyword signals from result titles.
+
+    This is a lightweight signal-discovery approach — it catches topics that are
+    actively discussed on XHS without direct platform access. Upgrade to a direct
+    XHS API if one becomes available.
+    """
+    queries = [
+        "小红书 游戏 热门话题",
+        "小红书 游戏 推荐 2026",
+    ]
+    all_keywords: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for query in queries:
+        try:
+            results = _search_with_fallback(query, max_results=5)
+        except Exception as e:
+            print(f"  [WARN] XHS search '{query}' failed: {e}", file=sys.stderr)
+            continue
+
+        for r in results:
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            combined = f"{title} {snippet}"
+
+            if not _is_game_relevant(combined):
+                continue
+
+            # Extract likely game-related keyword from title
+            kw = _normalize_keyword(title)
+            if kw and len(kw) >= 2 and kw not in seen:
+                seen.add(kw)
+                all_keywords.append({
+                    "keyword": kw,
+                    "source": "xiaohongshu",
+                    "rank": len(all_keywords) + 1,
+                })
+
+    return all_keywords
+
+
 def _is_game_relevant(text: str) -> bool:
     """Check if a topic text is game/tech relevant."""
     # First, exclude clear non-game topics
@@ -322,19 +441,18 @@ def _normalize_keyword(raw: str) -> str:
 # Phase 1.5: Hot Topic Search
 # ═══════════════════════════════════════════════════════════════════
 
-# DDG-first engine chain (user preference: DDG via VPN)
-# Engines are tried in order inside _search_with_fallback().
+# Engines are tried in order inside _search_with_fallback() — 360 → Sogou → Bing.
+# DDG removed (html.duckduckgo.com returns 202 with no results even with VPN).
 
 
 def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
     """Search game-related news for each hot keyword → hot_topic_news table.
 
-    DDG-first via VPN, fallback to domestic engines.
+    360-first via domestic engines (no VPN dependency).
     Results are cached via search_cache (24h TTL).
 
     Returns:
-        {"total_found": N, "keywords_searched": N,
-         "vpn_ok": bool, "warnings": [...]}
+        {"total_found": N, "keywords_searched": N, "warnings": [...]}
     """
     db = get_db()
 
@@ -344,7 +462,6 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
         return {
             "total_found": 0,
             "keywords_searched": 0,
-            "vpn_ok": None,
             "warnings": ["No hot keywords found for this date"],
         }
 
@@ -353,8 +470,6 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
     # ── Search per keyword ──
     all_results: list[dict[str, Any]] = []
     keywords_searched = 0
-    vpn_checked = False
-    vpn_ok: bool | None = None
 
     for kw in keywords:
         keyword = kw["keyword"]
@@ -374,13 +489,9 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
                     continue
             except Exception as e:
                 print(f"  [WARN] search cache read failed for '{keyword}': {e}", file=sys.stderr)
-        # Lazy VPN check: only probe DDG reachability on first cache miss,
-        # avoiding wasted HTTP calls when all keywords hit the 24h cache.
-        if not vpn_checked:
-            vpn_ok = _check_ddg_reachable()
-            vpn_checked = True
 
         results = _search_with_fallback(query, max_results=5)
+        keywords_searched += 1
         if results:
             for r in results:
                 r["keyword"] = keyword
@@ -447,32 +558,20 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
         except Exception as e:
             warnings.append(f"Failed to write hot topic news to DB: {e}")
 
-    # ── VPN health warning (only when we actually attempted a search) ──
-    if vpn_checked and vpn_ok is False:
-        warnings.append(
-            "DuckDuckGo 不可达（VPN 未开启或故障），热点搜索已回退到国内搜索引擎"
-        )
-
     return {
         "total_found": len(unique_results),
         "keywords_searched": keywords_searched,
-        "vpn_ok": vpn_ok if vpn_checked else True,  # True when all cache hits (no probe needed)
         "warnings": warnings,
     }
 
 
 def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """Search with DDG-first fallback chain. Returns results with search_engine tag."""
-    # Import engine functions lazily to avoid circular imports
-    from src.tools.web_search import (
-        _scrape_ddg,
-        _scrape_360,
-        _scrape_sogou,
-        _scrape_bing,
-    )
+    """Search with 360-first fallback chain. Returns results with search_engine tag.
 
+    DDG removed from chain (html.duckduckgo.com returns 202 with no results even
+    with VPN — confirmed 2026-06-26). 360/Sogou handle Chinese game queries well.
+    """
     engines: list[tuple[str, Any]] = [
-        ("ddg", _scrape_ddg),
         ("360", _scrape_360),
         ("sogou", _scrape_sogou),
         ("bing", _scrape_bing),
@@ -494,19 +593,6 @@ def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, An
     return []
 
 
-def _check_ddg_reachable() -> bool:
-    """Quick check if DuckDuckGo is reachable (VPN status proxy)."""
-    try:
-        resp = httpx.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": "test"},
-            headers={"User-Agent": UA},
-            timeout=8.0,
-        )
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"  [WARN] DDG reachability check failed: {e}", file=sys.stderr)
-        return False
 # ═══════════════════════════════════════════════════════════════════
 
 class _HotSelectedItem(BaseModel):
@@ -537,8 +623,6 @@ def _ai_filter_hot_topics(
     """
     if not candidates:
         return []
-
-    from src.agents.base import Agent, Tool
 
     # ── Limit input to keep prompt size reasonable ──
     MAX_CANDIDATES = 30
