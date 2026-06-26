@@ -196,90 +196,6 @@ def _scrape_sogou(query: str, max_results: int = 5) -> str:
 
     return json.dumps({"query": query, "results": results, "engine": "sogou"}, ensure_ascii=False)
 
-
-# ── Bing (fallback) ────────────────────────────────────────────
-
-def _scrape_bing(query: str, max_results: int = 5) -> str:
-    """Scrape Bing search results (free, accessible from China)."""
-    resp = httpx.get(
-        "https://www.bing.com/search",
-        params={"q": query, "count": max_results},
-        headers={"User-Agent": UA},
-        timeout=15.0,
-        follow_redirects=True,
-    )
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    results: list[dict[str, str]] = []
-
-    for item in soup.select("li.b_algo")[:max_results]:
-        title_link = item.select_one("h2 a")
-        if not title_link:
-            continue
-
-        title = title_link.get_text(strip=True)
-        url = title_link.get("href", "")
-
-        snippet_el = item.select_one(".b_caption p") or item.select_one(".b_caption")
-        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-
-        cite_el = item.select_one("cite")
-        display_url = cite_el.get_text(strip=True) if cite_el else ""
-
-        if title:
-            results.append({
-                "title": title,
-                "url": url or display_url,
-                "snippet": snippet,
-            })
-
-    if not results:
-        return json.dumps(
-            {"query": query, "results": [], "engine": "bing",
-             "note": "No results found. Bing may have changed their HTML structure."},
-            ensure_ascii=False,
-        )
-
-    return json.dumps({"query": query, "results": results, "engine": "bing"}, ensure_ascii=False)
-
-
-def _scrape_ddg(query: str, max_results: int = 5) -> str:
-    """Scrape DuckDuckGo HTML search (last-resort fallback)."""
-    resp = httpx.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers={"User-Agent": UA},
-        timeout=15.0,
-        follow_redirects=True,
-    )
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    results: list[dict[str, str]] = []
-
-    for item in soup.select(".result, .web-result, .result__body")[:max_results]:
-        title_el = item.select_one(".result__title, .result__a, a.result__a")
-        snippet_el = item.select_one(".result__snippet, .snippet")
-        link_el = item.select_one(".result__url")
-
-        title = title_el.get_text(strip=True) if title_el else ""
-        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-        link = link_el.get("href", "") if link_el else ""
-
-        if title:
-            results.append({"title": title, "url": link, "snippet": snippet})
-
-    if not results:
-        return json.dumps(
-            {"query": query, "results": [], "engine": "ddg",
-             "note": "No results found."},
-            ensure_ascii=False,
-        )
-
-    return json.dumps({"query": query, "results": results, "engine": "ddg"}, ensure_ascii=False)
-
-
 # ── Main entry ─────────────────────────────────────────────────
 
 def web_search(query: str, max_results: int = 5, **_meta: Any) -> str:
@@ -329,8 +245,6 @@ def web_search(query: str, max_results: int = 5, **_meta: Any) -> str:
     engines = [
         ("360", _scrape_360),
         ("sogou", _scrape_sogou),
-        ("bing", _scrape_bing),
-        ("ddg", _scrape_ddg),
     ]
 
     result_str = ""

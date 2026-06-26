@@ -19,6 +19,7 @@ import hashlib
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as _date
 from typing import Any
 
@@ -30,7 +31,7 @@ from pydantic import BaseModel
 
 from src.storage.sqlite import get_db
 from src.agents.base import Agent, Tool
-from src.tools.web_search import _scrape_360, _scrape_sogou, _scrape_bing
+from src.tools.web_search import _scrape_360, _scrape_sogou
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -84,44 +85,27 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
     all_keywords: list[dict[str, Any]] = []
     sources_used: list[str] = []
 
-    # ── Source 1: Baidu hot search ──
-    try:
-        baidu_kws = _fetch_baidu_hotspots()
-        if baidu_kws:
-            all_keywords.extend(baidu_kws)
-            sources_used.append("baidu")
-    except Exception as e:
-        print(f"  [WARN] Baidu hotspot scrape failed: {e}", file=sys.stderr)
+    # ── Parallel fetch from all external sources ──
+    # Each source is an independent HTTP call — run them concurrently
+    # to avoid serial timeout stacking (4 × 15s worst case → ~15s).
+    _SOURCES: list[tuple[str, Any]] = [
+        ("baidu", _fetch_baidu_hotspots),
+        ("zhihu", _fetch_zhihu_hotspots),
+        ("weibo", _fetch_weibo_hotspots),
+        ("xiaohongshu", _fetch_xiaohongshu_hotspots),
+    ]
 
-    # ── Source 2: Zhihu hot list ──
-    try:
-        zhihu_kws = _fetch_zhihu_hotspots()
-        if zhihu_kws:
-            all_keywords.extend(zhihu_kws)
-            sources_used.append("zhihu")
-    except Exception as e:
-        print(f"  [WARN] Zhihu hotspot scrape failed: {e}", file=sys.stderr)
-
-    # ── Source 3: Weibo hot search ──
-    try:
-        weibo_kws = _fetch_weibo_hotspots()
-        if weibo_kws:
-            all_keywords.extend(weibo_kws)
-            sources_used.append("weibo")
-    except Exception as e:
-        print(f"  [WARN] Weibo hotspot scrape failed: {e}", file=sys.stderr)
-
-    # ── Source 4: Xiaohongshu trending topics (via search aggregation) ──
-    # XHS is a SPA with no public hot-search API, so we search-aggregate
-    # instead of scraping directly. This catches game topics bubbling on XHS
-    # without needing Playwright. Can be upgraded to a direct API later.
-    try:
-        xhs_kws = _fetch_xiaohongshu_hotspots()
-        if xhs_kws:
-            all_keywords.extend(xhs_kws)
-            sources_used.append("xiaohongshu")
-    except Exception as e:
-        print(f"  [WARN] Xiaohongshu hotspot scrape failed: {e}", file=sys.stderr)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(fn): name for name, fn in _SOURCES}
+        for f in as_completed(futures):
+            name = futures[f]
+            try:
+                result = f.result()
+                if result:
+                    all_keywords.extend(result)
+                    sources_used.append(name)
+            except Exception as e:
+                print(f"  [WARN] {name} hotspot scrape failed: {e}", file=sys.stderr)
 
     # ── Source 5: Curated interests (always available) ──
     # Deep-copy each dict to avoid mutating the module-level constant
@@ -574,7 +558,6 @@ def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, An
     engines: list[tuple[str, Any]] = [
         ("360", _scrape_360),
         ("sogou", _scrape_sogou),
-        ("bing", _scrape_bing),
     ]
 
     for engine_name, engine_fn in engines:
