@@ -530,14 +530,16 @@ class BilibiliCreatorScraper:
                             pass
                         if title and len(title) > 5:
                             break
-            except Exception:
+            except Exception as e:
+                print(f"  [WARN] DOM标题提取失败 {bvid}: {e}", file=sys.stderr)
                 pass
 
             # Fallback: use the link's own text
             if not title or len(title) < 4:
                 try:
                     title = el.inner_text().strip()
-                except Exception:
+                except Exception as e:
+                    print(f"  [WARN] DOM inner_text获取失败 {bvid}: {e}", file=sys.stderr)
                     title = ""
 
             # Filter out purely numeric titles (durations/stats misidentified)
@@ -606,7 +608,8 @@ class BilibiliCreatorScraper:
         try:
             from src.storage.sqlite import get_db
             return get_db().get_reported_keys(NewsSource.BILIBILI)
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] DB加载已报告BVID失败: {e}", file=sys.stderr)
             return set()
 
     @staticmethod

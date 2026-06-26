@@ -207,7 +207,8 @@ class SteamPorts(ChartScraper):
             resp = client.get(taptap_url)
             resp.raise_for_status()
             page_text = resp.text
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] TapTap页面请求失败 ({taptap_url}): {e}", file=sys.stderr)
             return False, False
 
         page_lower = page_text.lower()
@@ -276,7 +277,8 @@ class SteamPorts(ChartScraper):
             for kw in port_keywords:
                 if kw.lower() in all_text.lower():
                     return True
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] 搜索引擎移植检测失败 ({game_name}): {e}", file=sys.stderr)
             pass
         return False
 

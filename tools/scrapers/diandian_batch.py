@@ -218,7 +218,8 @@ def discover() -> int:
                         new_url = page.url
                         print(f"  点击 '{platform_label}' → URL: {new_url}")
                         break
-                except Exception:
+                except Exception as e:
+                    print(f"  [WARN] 平台切换失败 ({platform_label}): {e}", file=sys.stderr)
                     continue
 
             # ---- 5. 尝试点击切换榜单类型看 URL 变化 ----
@@ -282,7 +283,8 @@ def _switch_to_game_category(page) -> None:
                 page.wait_for_timeout(3_000)
                 print("  ✓ 已切换到「游戏」")
                 return
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] 切换到游戏分类失败 ({sel}): {e}", file=sys.stderr)
             continue
 
 

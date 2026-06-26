@@ -405,7 +405,8 @@ def _sync_to_db(csv_path: Path, date: str) -> None:
                         is_steam_port=is_steam,
                     )
                     track_relevant = track_label == "track"
-                except Exception:
+                except Exception as e:
+                    print(f"  [WARN] track_filter分类失败 ({game_name}): {e}", file=sys.stderr)
                     track_relevant = False
 
                 records.append({

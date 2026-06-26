@@ -509,7 +509,8 @@ class NewsFeeds(ChartScraper):
                         date_str = cls._extract_date_from_text(date_el.get_text(strip=True))
                         if date_str:
                             return date_str
-                except Exception:
+                except Exception as e:
+                    print(f"  [WARN] 日期提取失败 (selector={selector}): {e}", file=sys.stderr)
                     pass
 
         # Strategy 3: URL pattern
@@ -529,7 +530,8 @@ class NewsFeeds(ChartScraper):
                 description=headline,
             )
             return result == "track"
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] track_filter分类失败, 使用关键词兜底: {e}", file=sys.stderr)
             # Fallback: simple keyword check
             track_kw = ["塔防", "TD", "Tower Defense", "肉鸽", "Roguelike", "Roguelite"]
             combined = f"{headline} {related_game}".lower()
