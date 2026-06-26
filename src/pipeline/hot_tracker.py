@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from src.types import HotTopicItem
+from src.pipeline.token_utils import headline_dedup_tokens
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
@@ -527,6 +528,9 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
             try:
                 ai_selected = _ai_filter_hot_topics(unique_results, date)
                 if ai_selected:
+                    ai_selected = _dedup_against_market_news(
+                        ai_selected, date, unique_results
+                    )
                     urls = [r["url"] for r in ai_selected if r.get("url")]
                     if urls:
                         db.mark_hot_topic_selected(urls, date)
@@ -535,8 +539,22 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
             except Exception as e:
                 print(f"  [WARN] Hot Tracker Agent failed, using fallback: {e}",
                       file=sys.stderr)
-                # Fallback: simple first 7 by search order
-                urls = [r["url"] for r in records[:7] if r["url"]]
+                # Fallback: simple first 7 by search order, deduped against market
+                fallback_items = [
+                    {
+                        "headline": r.get("headline", ""),
+                        "url": r.get("url", ""),
+                        "source": r.get("source", ""),
+                        "snippet": r.get("snippet", ""),
+                        "search_engine": r.get("search_engine", ""),
+                        "keyword": r.get("keyword", ""),
+                    }
+                    for r in records[:7]
+                ]
+                fallback_deduped = _dedup_against_market_news(
+                    fallback_items, date, unique_results[:30]
+                )
+                urls = [r["url"] for r in fallback_deduped if r.get("url")]
                 if urls:
                     db.mark_hot_topic_selected(urls, date)
         except Exception as e:
@@ -547,6 +565,123 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
         "keywords_searched": keywords_searched,
         "warnings": warnings,
     }
+
+
+def _dedup_against_market_news(
+    selected: list[dict[str, Any]], date: str, pool: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Dedup hot topic items against today's market news headlines.
+
+    If a hot topic headline shares dedup tokens with a market news headline,
+    it's a duplicate — drop it and recruit the next available item from *pool*.
+
+    Args:
+        selected: Currently selected hot topic items (AI or fallback).
+        date: Report date for loading market news.
+        pool: Full unique_results pool (for recruiting replacements).
+
+    Returns:
+        Deduped list (may be shorter than input if pool is exhausted).
+    """
+    from src.storage.sqlite import get_db
+    db = get_db()
+
+    # Load today's market news headlines
+    try:
+        market_news = db.get_market_news_by_date(date)
+    except Exception as e:
+        print(f"  [WARN] Failed to load market news for dedup: {e}", file=sys.stderr)
+        return selected  # can't dedup, return as-is
+
+    if not market_news:
+        return selected  # nothing to dedup against
+
+    # Build token sets for all market news headlines
+    market_token_sets: list[set[str]] = []
+    for mn in market_news:
+        hl = mn.get("headline", "") or ""
+        tokens = headline_dedup_tokens(hl)
+        if tokens:
+            market_token_sets.append(tokens)
+
+    if not market_token_sets:
+        return selected
+
+    # URLs of market news (for direct URL match)
+    market_urls: set[str] = set()
+    for mn in market_news:
+        url = (mn.get("url", "") or "").lower().strip()
+        if url:
+            market_urls.add(url)
+
+    deduped: list[dict[str, Any]] = []
+    selected_urls: set[str] = set()
+
+    for item in selected:
+        item_url = (item.get("url", "") or "").lower().strip()
+
+        # Direct URL match
+        if item_url and item_url in market_urls:
+            print(f"  [DEDUP] Hot topic URL matched market news: {item_url[:80]}",
+                  file=sys.stderr)
+            continue
+
+        # Token-level match
+        item_headline = item.get("headline", "") or item.get("title", "") or ""
+        item_tokens = headline_dedup_tokens(item_headline)
+        if item_tokens:
+            is_dup = False
+            for mt in market_token_sets:
+                if item_tokens & mt:
+                    overlap = item_tokens & mt
+                    print(f"  [DEDUP] Hot topic tokens overlap with market: "
+                          f"{item_headline[:60]}... ←→ {overlap}", file=sys.stderr)
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+
+        deduped.append(item)
+        selected_urls.add(item_url)
+
+    # Recruit replacements from pool for dropped items
+    dropped = len(selected) - len(deduped)
+    if dropped > 0:
+        print(f"  [DEDUP] {dropped} hot topic(s) dropped (market overlap),"
+              f" recruiting replacements...", file=sys.stderr)
+        for p in pool:
+            p_url = (p.get("url", "") or "").lower().strip()
+            # Skip already selected or dropped
+            if p_url in selected_urls or p_url in market_urls:
+                continue
+            # Check token overlap
+            p_headline = p.get("title", "") or p.get("headline", "") or ""
+            p_tokens = headline_dedup_tokens(p_headline)
+            if p_tokens:
+                is_dup = False
+                for mt in market_token_sets:
+                    if p_tokens & mt:
+                        is_dup = True
+                        break
+                if is_dup:
+                    continue
+            deduped.append({
+                "headline": p_headline,
+                "url": p_url,
+                "source": p.get("source", "") or p.get("search_engine", ""),
+                "snippet": p.get("snippet", ""),
+                "search_engine": p.get("search_engine", ""),
+                "keyword": p.get("keyword", ""),
+            })
+            selected_urls.add(p_url)
+            if len(deduped) >= len(selected):
+                break
+
+    if len(deduped) < len(selected):
+        print(f"  [DEDUP] Only {len(deduped)}/{len(selected)} items after dedup"
+              f" (pool exhausted)", file=sys.stderr)
+
+    return deduped
 
 
 def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, Any]]:
