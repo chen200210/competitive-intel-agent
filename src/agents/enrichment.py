@@ -14,6 +14,7 @@ import sys
 from typing import Any
 
 from src.pipeline.source_constants import is_bilibili
+from src.types import ScoredNewsItem
 
 
 # ═════════════════════════════════════════════════════════════
@@ -135,9 +136,9 @@ def is_image_too_small(image_url: str, min_dim: int = 200, min_kb: int = 5) -> b
 
 
 def enrich_news_images(
-    news_items: list[dict[str, Any]],
+    news_items: list[ScoredNewsItem],
     max_fetch: int = 5,
-) -> list[dict[str, Any]]:
+) -> list[ScoredNewsItem]:
     """For news items without image_url, fetch og:image from article page.
 
     B站 items already have image_url from bilibili_videos.cover.
@@ -193,7 +194,7 @@ def enrich_news_images(
 
 
 def collect_card_image_urls(
-    news_items: list[dict[str, Any]],
+    news_items: list[ScoredNewsItem],
     max_images: int = 3,
 ) -> list[str]:
     """Collect image URLs from news items for Feishu card embedding.

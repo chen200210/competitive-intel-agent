@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from src.agents.base import Agent
 from src.pipeline.source_constants import is_bilibili, is_overseas, NewsSource
+from src.types import EnrichedNewsItem, ScoredNewsItem
 
 
 # ═════════════════════════════════════════════════════════════
@@ -403,12 +404,12 @@ _PREFILTER_SIGNAL_THRESHOLD_DEFAULT = 15
 
 
 def ai_summarize_and_judge(
-    candidates: list[dict[str, Any]],
+    candidates: list[EnrichedNewsItem],
     date: str,
     top_n: int | None = None,
     day_type: str = "normal",
     verbose: bool = False,
-) -> list[dict[str, Any]]:
+) -> list[ScoredNewsItem]:
     """Batch AI: summarize each candidate, score on 0-100 scale, select top N.
 
     Returns the selected items with ai_summary, ai_score, and ai_verdict
@@ -721,7 +722,7 @@ _DEDUP_NOISE: set[str] = {
 }
 
 
-def _is_same_story(a: dict[str, Any], b: dict[str, Any]) -> bool:
+def _is_same_story(a: ScoredNewsItem, b: ScoredNewsItem) -> bool:
     """Check whether two scored candidates describe the same underlying event.
 
     Designed to catch cross-language duplicates — for example when a
@@ -828,11 +829,11 @@ def _named_entities(text: str) -> set[str]:
 # ═════════════════════════════════════════════════════════════
 
 def _select_top_n(
-    scored_items: list[tuple[dict[str, Any], float]],
+    scored_items: list[tuple[ScoredNewsItem, float]],
     max_total: int = 7,
     max_bilibili: int = 2,
     max_per_source: int = 3,
-) -> list[dict[str, Any]]:
+) -> list[ScoredNewsItem]:
     """Greedy top-N by AI score, with source diversity caps.
 
     Constraints:

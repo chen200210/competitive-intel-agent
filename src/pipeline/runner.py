@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from src.storage.sqlite import get_db
+from src.types import PipelineRunStats
 
 
 def _run_parallel(tasks: list[tuple[str, Any, tuple, dict]], max_workers: int = 8) -> list[dict]:

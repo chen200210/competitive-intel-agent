@@ -30,22 +30,26 @@ import uuid as _uuid
 from typing import Any
 
 from src.pipeline.source_constants import NewsSource
+from src.types import (
+    NewGameEntry, ChangeRecord, ScoredNewsItem, HotTopicItem,
+    BriefContext, BilibiliVideo, RawNewsItem,
+)
 
 
 def brief(
     date: str,
     day_type: str = "normal",
-    taptap_games: list[dict[str, Any]] | None = None,
-    steam_ports: list[dict[str, Any]] | None = None,
-    market_news: list[dict[str, Any]] | None = None,
-    sector_changes: list[dict[str, Any]] | None = None,
+    taptap_games: list[NewGameEntry] | None = None,
+    steam_ports: list[NewGameEntry] | None = None,
+    market_news: list[ScoredNewsItem] | None = None,
+    sector_changes: list[ChangeRecord] | None = None,
     new_games_note: str = "",
     verbose: bool = False,
     warnings: list[str] | None = None,
     hot_topics_md: str = "",
-    hot_items: list[dict[str, Any]] | None = None,
+    hot_items: list[HotTopicItem] | None = None,
     yesterday_new_games: set[str] | None = None,
-) -> dict[str, Any]:
+) -> BriefContext:
     """Generate a Feishu card JSON for the daily report.
 
     Card structure (4 sections, assembled in code — no AI hallucination):
@@ -256,7 +260,7 @@ def brief(
     return card_data
 
 
-def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None = None) -> dict[str, Any]:
+def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None = None) -> BriefContext:
     """Run Briefer using all data already in the database.
 
     Reads from: taptap_new_games, steam_port_games, market_news,
@@ -435,7 +439,7 @@ def _yesterday_shown_games(db, yesterday_str: str) -> set[str]:
 # Data conversion: B站 videos → news-compatible format
 # ═════════════════════════════════════════════════════════════
 
-def _bilibili_to_news(videos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _bilibili_to_news(videos: list[BilibiliVideo]) -> list[RawNewsItem]:
     """Convert bilibili_videos rows into market_news-compatible format.
 
     Runs track_filter on each video title to determine relevance.

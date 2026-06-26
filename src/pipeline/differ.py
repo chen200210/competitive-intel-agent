@@ -15,6 +15,7 @@ from typing import Any
 import sys
 
 from src.storage.sqlite import get_db
+from src.types import RankingEntry, ChangeRecord
 
 
 # ── Configurable thresholds ──────────────────────────────────
@@ -180,8 +181,8 @@ def classify_day(
 def _diff_one_chart(
     date: str,
     prev_date: str,
-    today_rows: list[dict[str, Any]],
-    yesterday_rows: list[dict[str, Any]],
+    today_rows: list[RankingEntry],
+    yesterday_rows: list[RankingEntry],
 ) -> dict[str, Any]:
     """
     Diff a single (platform, chart_type) group.
@@ -200,7 +201,7 @@ def _diff_one_chart(
         "stable": 0,
         "big_moves": 0,
     }
-    changes: list[dict[str, Any]] = []
+    changes: list[ChangeRecord] = []
 
     # 1. Iterate today's rankings
     for bundle_id, t in today_map.items():

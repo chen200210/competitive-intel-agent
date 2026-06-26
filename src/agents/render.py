@@ -17,14 +17,16 @@ import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
+from src.types import NewGameEntry, ChangeRecord, ScoredNewsItem, HotTopicItem
+
 
 # ═════════════════════════════════════════════════════════════
 # New games section
 # ═════════════════════════════════════════════════════════════
 
 def build_new_games_md(
-    steam_ports: list[dict[str, Any]],
-    taptap_games: list[dict[str, Any]],
+    steam_ports: list[NewGameEntry],
+    taptap_games: list[NewGameEntry],
     note: str = "",
 ) -> str:
     """Build the new-games section markdown in code. No LLM hallucination.
@@ -145,7 +147,7 @@ def _match_new_game(rank_name: str, yesterday_names: set[str]) -> bool:
 
 
 def build_ranking_md(
-    changes: list[dict[str, Any]],
+    changes: list[ChangeRecord],
     yesterday_new_games: set[str] | None = None,
 ) -> str:
     """Build the ranking section markdown in code. No LLM table hallucination.
@@ -260,7 +262,7 @@ def _split_markdown_entries(
 
 def build_market_elements(
     market_md: str,
-    top_news: list[dict[str, Any]],
+    top_news: list[ScoredNewsItem],
     date: str = "",
 ) -> list[dict[str, Any]]:
     """Split market_md into per-news blocks and interleave images + feedback buttons.
@@ -344,7 +346,7 @@ def build_market_elements(
 # ═════════════════════════════════════════════════════════════
 
 def build_hot_topics_md(
-    hot_items: list[dict[str, Any]],
+    hot_items: list[HotTopicItem],
     keywords: list[str] | None = None,
 ) -> str:
     """Build the hot-topic section markdown in code (zero AI).
@@ -400,7 +402,7 @@ def build_hot_topics_md(
 
 def build_hot_topic_elements(
     hot_topics_md: str,
-    hot_items: list[dict[str, Any]],
+    hot_items: list[HotTopicItem],
     date: str = "",
 ) -> list[dict[str, Any]]:
     """Split hot_topics_md into per-item card elements with "感兴趣" buttons.

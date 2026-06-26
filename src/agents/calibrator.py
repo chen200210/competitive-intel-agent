@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from typing import Any
 
@@ -432,11 +433,29 @@ _DIM_MAX = 70              # Ceiling for any single dimension
 
 
 def _match_topic(headline: str, topic: str) -> bool:
-    """Check whether *headline* contains any keyword for *topic*."""
+    """Check whether *headline* contains any keyword for *topic*.
+
+    Short Latin tokens (≤3 chars, all ASCII) require word boundaries to
+    avoid substring false-positives: ``"IP"`` matching ``"chip"``,
+    ``"AI"`` matching ``"train"``.
+    """
     keywords = TOPIC_KEYWORD_MAP.get(topic, [])
     if not keywords:
         return False
-    return any(kw.lower() in headline.lower() for kw in keywords)
+    hl_lower = headline.lower()
+    for kw in keywords:
+        kw_lower = kw.lower()
+        if kw_lower in hl_lower:
+            # Short Latin tokens need word-boundary check.
+            # MUST use re.ASCII: in Python's default Unicode mode,
+            # CJK characters are \w, so \bAI\b would NOT match
+            # "AI游戏引擎" (no boundary between I and 游).
+            if len(kw) <= 3 and kw.isascii() and kw.isalpha():
+                if not re.search(rf"\b{re.escape(kw_lower)}\b", hl_lower,
+                                 flags=re.ASCII):
+                    continue
+            return True
+    return False
 
 
 def _analyze_feedback_rules(
@@ -486,13 +505,20 @@ def _analyze_feedback_rules(
         if boost != 0:
             topic_boosts[topic] = boost
 
-    # ── Merge with previous topic_boosts (decay absent topics) ──
+    # ── Merge with previous topic_boosts (symmetric decay for absent topics) ──
+    # Both positive and negative boosts decay at 50% per run when the topic
+    # has no new evidence.  Once the absolute value reaches 0 the entry is
+    # dropped — no lingering near-zero noise.
     for topic, prev_val in prev_topic_boosts.items():
         if topic not in topic_boosts:
             if prev_val > 0:
                 decayed = prev_val // 2
-                if decayed > 0:
-                    topic_boosts[topic] = decayed
+            elif prev_val < 0:
+                decayed = -((-prev_val) // 2)   # round toward zero
+            else:
+                decayed = 0
+            if decayed != 0:
+                topic_boosts[topic] = decayed
 
     # ── Phase B: dim_weights from label × sentiment analysis ──
     track_rows = [f for f in feedback if f.get("track_relevant")]
@@ -517,6 +543,13 @@ def _analyze_feedback_rules(
     insight_up = sum(f["up"] for f in insight_rows)
     insight_down = sum(f["down"] for f in insight_rows)
     insight_net = insight_up - insight_down
+
+    # Row counts for finding evidence (used in Phase C)
+    dim_row_counts: dict[str, int] = {
+        "track": len(track_rows),
+        "density": len(density_rows),
+        "insight": len(insight_rows),
+    }
 
     dim_signals = [
         ("track", track_net, prev_dim_weights.get("track", 40)),
@@ -555,6 +588,9 @@ def _analyze_feedback_rules(
         boost = topic_boosts[topic]
         ev = topic_evidence.get(topic, {"up": 0, "down": 0, "count": 0})
         evidence_count = ev["count"]
+        # Skip decay-only topics — no current-run evidence to report
+        if evidence_count == 0:
+            continue
         if boost > 0:
             pattern = f"{topic}话题报道持续获用户好评（{ev['up']}👍 / {ev['down']}👎）"
             action = f"topic_boosts.{topic} +{boost}"
@@ -578,7 +614,7 @@ def _analyze_feedback_rules(
             direction = "正向" if delta > 0 else "负向"
             findings.append(CalibratorFinding(
                 pattern=f"{dim}维度用户反馈净{direction}（净{'+' if delta > 0 else ''}{delta}），调整权重",
-                evidence_count=abs(delta),
+                evidence_count=dim_row_counts.get(dim, 0),
                 action=f"dim_weights.{dim} {prev_val}→{new_val}",
                 confidence="medium",
             ))
@@ -813,7 +849,7 @@ def apply_topic_boosts(headline: str, ai_score: int, topic_boosts: dict[str, int
 
     adjusted = ai_score
     for topic, boost in topic_boosts.items():
-        if topic in headline:
+        if _match_topic(headline, topic):
             adjusted += boost
 
     return max(0, min(100, adjusted))

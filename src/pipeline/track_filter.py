@@ -26,6 +26,8 @@ import functools
 import sys
 from typing import Any
 
+from src.types import NewGameEntry, ChangeRecord
+
 
 # ── Default keyword lists (fallback if YAML unavailable) ─────
 
@@ -182,7 +184,7 @@ def classify_game(
     return "neutral"
 
 
-def should_include(game: dict[str, Any]) -> bool:
+def should_include(game: NewGameEntry) -> bool:
     """Check if a game dict should be included in the report.
 
     Returns True for 'track' and 'neutral' classifications.
@@ -203,7 +205,7 @@ def should_include(game: dict[str, Any]) -> bool:
     return classification != "ignored"
 
 
-def filter_games(games: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def filter_games(games: list[NewGameEntry]) -> dict[str, list[NewGameEntry]]:
     """Classify a list of game dicts into three buckets.
 
     Each game dict gets a `_track_classification` field added in-place.
@@ -246,7 +248,7 @@ def _parse_tags(tags_value: str | list[str] | None) -> list[str]:
     return []
 
 
-def filter_track_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_track_changes(changes: list[ChangeRecord]) -> list[ChangeRecord]:
     """Filter a list of change dicts to track-relevant games only.
 
     Uses classify_game() for primary classification (brand signals, Steam ports,

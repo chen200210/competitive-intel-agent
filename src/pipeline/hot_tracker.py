@@ -23,6 +23,8 @@ from datetime import date as _date
 from typing import Any
 
 import httpx
+
+from src.types import HotTopicItem
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
@@ -522,7 +524,7 @@ class _HotFilterOutput(BaseModel):
 
 def _ai_filter_hot_topics(
     candidates: list[dict[str, Any]], date: str
-) -> list[dict[str, Any]]:
+) -> list[HotTopicItem]:
     """Run the Hot Tracker Agent to filter + summarise search results.
 
     The Agent gets a web_fetch tool so it can open URLs when the search
@@ -647,7 +649,7 @@ def _ai_filter_hot_topics(
 
 
 def _persist_ai_summaries(
-    selected: list[dict[str, Any]], date: str, db: Any
+    selected: list[HotTopicItem], date: str, db: Any
 ) -> None:
     """Write AI summaries back to hot_topic_news rows matched by URL."""
     try:

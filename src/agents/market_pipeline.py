@@ -22,6 +22,7 @@ from typing import Any
 
 from src.pipeline.source_constants import is_bilibili
 from src.pipeline.token_utils import _RE_GAME_NAMES, _RE_TOPIC_WORDS
+from src.types import RawNewsItem, EnrichedNewsItem
 
 
 # ── 二次元过滤器辅助 ──
@@ -69,7 +70,7 @@ def _has_known_game_name(headline: str) -> bool:
 # ═════════════════════════════════════════════════════════════
 
 def filter_news(news: list[dict[str, Any]], target_date: str = "",
-                ) -> list[dict[str, Any]]:
+                ) -> list[RawNewsItem]:
     """Hard-filter news: block keywords, dedup, freshness gate, track exclusions.
 
     Returns ALL survivors. No scoring, no diversity selection — AI handles
@@ -273,8 +274,8 @@ def _extract_date_from_url(url: str) -> str:
 # ═════════════════════════════════════════════════════════════
 
 def apply_fatigue(
-    candidates: list[dict[str, Any]], date: str, window_days: int = 3,
-) -> list[dict[str, Any]]:
+    candidates: list[RawNewsItem], date: str, window_days: int = 3,
+) -> list[RawNewsItem]:
     """Downgrade or remove candidates whose topics appeared in recent reports.
 
     Rules:
@@ -380,7 +381,7 @@ def apply_fatigue(
 # Phase B: deep fetch article bodies
 # ═════════════════════════════════════════════════════════════
 
-def deep_fetch(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def deep_fetch(candidates: list[RawNewsItem]) -> list[EnrichedNewsItem]:
     """Enrich candidate news items with article body text.
 
     Runs HTTP fetches sequentially to avoid hammering servers.
