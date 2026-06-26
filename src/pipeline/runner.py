@@ -460,6 +460,115 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
         print(f"  Cleanup: removed {deleted} old CSV(s) from {raw_dir}")
 
 
+def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
+    """Afternoon hot-topic refresh — re-collect keywords, re-search, push standalone card.
+
+    Unlike the full pipeline, this only touches hot-topic phases and does not
+    re-scrape or re-run Differ / StoryPicker / Briefer.
+
+    Returns:
+        {"date": date, "keywords": [...], "hot_items": [...], "pushed": bool}
+    """
+    from datetime import datetime as _dt
+    from src.pipeline.hot_tracker import collect_hot_keywords, search_hot_topics
+    from src.agents.render import build_hot_topics_md, build_hot_topic_elements
+
+    print(f"\n{'='*50}")
+    print(f"  🔥 Hot-Only Update: {date}")
+    print(f"{'='*50}")
+
+    db = get_db()
+
+    # ── Phase 0.5: Re-collect hot keywords (afternoon trends differ from morning) ──
+    print("\n── Hot Keywords (re-collect) ──")
+    kw_result = collect_hot_keywords(date)
+    keywords = kw_result.get("keywords", [])
+    if not keywords:
+        print("  [WARN] No hot keywords collected — aborting hot-only update")
+        return {"date": date, "keywords": [], "hot_items": [], "pushed": False}
+    print(f"  [OK] {kw_result['count']} keywords from {kw_result.get('sources', [])}")
+    if keywords:
+        kw_tags = " · ".join(k["keyword"] for k in keywords[:5])
+        print(f"       {kw_tags}")
+
+    # ── Phase 1.5: Re-search (force to bypass morning cache) ──
+    print("\n── Hot Topic Search (force re-search) ──")
+    hot_result = search_hot_topics(date, force=True)
+    total_found = hot_result.get("total_found", 0)
+    print(f"  [OK] Found {total_found} articles across"
+          f" {hot_result.get('keywords_searched', 0)} keywords")
+    if hot_result.get("warnings"):
+        for w in hot_result["warnings"]:
+            print(f"  [WARN] {w}")
+
+    # ── Read AI-selected items from DB ──
+    hot_items = db.get_hot_topic_news_by_date(date, selected=True, limit=7)
+    hot_keyword_names = [k["keyword"] for k in keywords]
+
+    if not hot_items:
+        # Fallback: unselected items by search order
+        hot_items = db.get_hot_topic_news_by_date(date, selected=False, limit=7)
+        print(f"  [INFO] No AI-selected items, using search-order fallback ({len(hot_items)} items)")
+
+    # ── Print selected items to terminal ──
+    if hot_items:
+        print(f"\n── Selected Hot Topics ({len(hot_items)} items) ──")
+        for i, item in enumerate(hot_items, 1):
+            headline = item.get("headline", "") or item.get("title", "") or "(no title)"
+            source = item.get("source", "") or item.get("search_engine", "")
+            score = item.get("value_score", "?")
+            summary = item.get("ai_summary", "") or item.get("snippet", "") or ""
+            summary_short = summary[:100] + "…" if len(summary) > 100 else summary
+            print(f"  {i}. [{score}] {headline}")
+            print(f"     {source} — {summary_short}")
+
+    # ── Build standalone hot-topic card ──
+    now = _dt.now().strftime("%H:%M")
+    hot_md = build_hot_topics_md(hot_items, hot_keyword_names) if hot_items else ""
+    hot_elements = build_hot_topic_elements(hot_md, hot_items, date=date) if hot_items else []
+
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": f"🕐 更新于 {now} · 关键词重新采集 · 搜索强制刷新",
+        },
+    ]
+    elements.extend(hot_elements)
+
+    card_data: dict[str, Any] = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": f"🔥 午间热点速报 | {date}"},
+                "template": "red",
+            },
+            "elements": elements,
+        },
+    }
+
+    pushed = False
+    if push_chat_id and (hot_items or hot_md):
+        print(f"\n── Push ──")
+        from src.feishu.pusher import push_card
+        push_result = push_card(card_data, push_chat_id)
+        if push_result.get("success"):
+            print(f"  [OK] Hot-only card pushed to {push_chat_id}")
+            pushed = True
+        else:
+            print(f"  [FAIL] Push failed: {push_result.get('error', 'unknown')}")
+
+    print(f"\n{'='*50}")
+    print(f"  Hot-Only complete: {len(hot_items)} items, pushed={pushed}")
+    print(f"{'='*50}")
+
+    return {
+        "date": date,
+        "keywords": keywords,
+        "hot_items": hot_items,
+        "pushed": pushed,
+    }
+
+
 # ═════════════════════════════════════════════════════════════
 # CLI
 # ═════════════════════════════════════════════════════════════
@@ -483,12 +592,21 @@ if __name__ == "__main__":
                         help="Run Calibrator agent (feedback-driven scoring parameter tuning)")
     parser.add_argument("--calibrate-days", type=int, default=14,
                         help="Days of feedback to analyze for calibration (default 14)")
+    parser.add_argument("--hot-only", action="store_true",
+                        help="Afternoon hot-topic refresh only (re-collect keywords, re-search, push standalone card)")
     args = parser.parse_args()
 
     date_arg = args.date
     if date_arg is None:
         from datetime import date as dt_date
         date_arg = dt_date.today().strftime("%Y-%m-%d")
+
+    # ── Hot-Only (standalone afternoon refresh) ──
+    if args.hot_only:
+        result = run_hot_only(date_arg, push_chat_id=args.push)
+        if args.brief_only:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        sys.exit(0)
 
     # ── Calibrator (standalone — runs instead of pipeline) ──
     if args.calibrate:
