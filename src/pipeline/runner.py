@@ -66,6 +66,7 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
     db = get_db()
     steps: list[dict[str, Any]] = []
     pipeline_warnings: list[str] = []  # non-fatal issues collected for health summary
+    fatal_hot_error = False
     t_total = _time.monotonic()
 
     def _step(name: str, fn, *args, **kwargs) -> Any:
@@ -141,16 +142,30 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
     # ═════════════════════════════════════════════════════════════
     # Phase 1.5: Hot Topic Search (DDG-first via VPN, fallback to domestic engines)
     # ═════════════════════════════════════════════════════════════
-    from src.pipeline.hot_tracker import search_hot_topics
-    hot_result = _step("Hot Topic Search", search_hot_topics, date, force=force)
-    if hot_result.get("warnings"):
-        for w in hot_result["warnings"]:
-            pipeline_warnings.append(f"Hot Topic: {w}")
-    if verbose and hot_result.get("total_found"):
-        print(f"         hot topic search: found {hot_result['total_found']} articles across"
-              f" {hot_result.get('keywords_searched', 0)} keywords")
-        if not hot_result.get("vpn_ok"):
-            print(f"         [WARN] DDG unreachable (VPN down), used fallback engines")
+    from src.config import is_hot_tracker_enabled, is_hot_tracker_required
+    if is_hot_tracker_enabled():
+        from src.pipeline.hot_tracker import search_hot_topics
+        hot_result = _step("Hot Topic Search", search_hot_topics, date, force=force)
+        if hot_result.get("warnings"):
+            for w in hot_result["warnings"]:
+                pipeline_warnings.append(f"Hot Topic: {w}")
+        if hot_result.get("error"):
+            msg = f"Hot Topic Search failed: {hot_result.get('error')}"
+            if is_hot_tracker_required():
+                fatal_hot_error = True
+                pipeline_warnings.append(msg)
+            else:
+                pipeline_warnings.append(f"{msg} (ignored: hot_tracker.required=false)")
+        if verbose and hot_result.get("total_found"):
+            print(f"         hot topic search: found {hot_result['total_found']} articles across"
+                  f" {hot_result.get('keywords_searched', 0)} keywords")
+            if not hot_result.get("vpn_ok"):
+                print(f"         [WARN] DDG unreachable (VPN down), used fallback engines")
+    else:
+        hot_result = _step(
+            "Hot Topic Search",
+            lambda: {"skipped": True, "reason": "hot_tracker.disabled"},
+        )
 
     # ═════════════════════════════════════════════════════════════
     # Phase 2: Briefer (reads DB directly — all scraper + pipeline data)
@@ -207,9 +222,11 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
 
     # ── FATAL classification ──
     # Briefer produced no card → pipeline is useless, treat as fatal.
-    fatal = not card
-    if fatal:
+    fatal = (not card) or fatal_hot_error
+    if not card:
         pipeline_warnings.insert(0, "FATAL: Briefer produced no card — pipeline output is empty")
+    elif fatal_hot_error:
+        pipeline_warnings.insert(0, "FATAL: Hot Tracker failed and hot_tracker.required=true")
 
     # ── Save pipeline_runs record for monitoring ──
     try:
@@ -470,8 +487,20 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
         {"date": date, "keywords": [...], "hot_items": [...], "pushed": bool}
     """
     from datetime import datetime as _dt
+    from src.config import is_hot_tracker_enabled
     from src.pipeline.hot_tracker import collect_hot_keywords, search_hot_topics
     from src.agents.render import build_hot_topics_md, build_hot_topic_elements
+    hot_enabled = is_hot_tracker_enabled()
+    if not hot_enabled:
+        print("  [SKIP] Hot tracker disabled by config")
+        return {
+            "date": date,
+            "keywords": [],
+            "hot_items": [],
+            "pushed": False,
+            "skipped": True,
+            "reason": "hot_tracker.disabled",
+        }
 
     print(f"\n{'='*50}")
     print(f"  🔥 Hot-Only Update: {date}")

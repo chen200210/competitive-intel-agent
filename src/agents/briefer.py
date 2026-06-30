@@ -379,10 +379,15 @@ def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None =
         sector_changes = extras + sector_changes
 
     # ── Hot topics data ──
-    hot_items = db.get_hot_topic_news_by_date(date, selected=True, limit=7)
-    hot_keywords_rows = db.get_hot_keywords_by_date(date)
-    hot_keywords = [row.get("keyword", "") for row in hot_keywords_rows if row.get("keyword")]
-    hot_topics_md = build_hot_topics_md(hot_items, hot_keywords) if hot_items else ""
+    from src.config import is_hot_tracker_enabled
+    if is_hot_tracker_enabled():
+        hot_items = db.get_hot_topic_news_by_date(date, selected=True, limit=7)
+        hot_keywords_rows = db.get_hot_keywords_by_date(date)
+        hot_keywords = [row.get("keyword", "") for row in hot_keywords_rows if row.get("keyword")]
+        hot_topics_md = build_hot_topics_md(hot_items, hot_keywords) if hot_items else ""
+    else:
+        hot_items = []
+        hot_topics_md = ""
 
     return brief(
         date=date,

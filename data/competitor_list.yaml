@@ -3,6 +3,10 @@
 # ============================================
 
 # === 公司业务方向定义 ===
+hot_tracker:
+  enabled: false
+  required: false
+
 business_focus:
   genres:
     - "塔防"

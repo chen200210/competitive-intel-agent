@@ -83,6 +83,16 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
     Returns:
         {"keywords": [...], "sources": [...], "count": N}
     """
+    from src.config import is_hot_tracker_enabled
+    if not is_hot_tracker_enabled():
+        return {
+            "keywords": [],
+            "sources": [],
+            "count": 0,
+            "skipped": True,
+            "reason": "hot_tracker.disabled",
+        }
+
     all_keywords: list[dict[str, Any]] = []
     sources_used: list[str] = []
 
@@ -769,6 +779,16 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
     Returns:
         {"total_found": N, "keywords_searched": N, "warnings": [...]}
     """
+    from src.config import is_hot_tracker_enabled
+    if not is_hot_tracker_enabled():
+        return {
+            "total_found": 0,
+            "keywords_searched": 0,
+            "warnings": [],
+            "skipped": True,
+            "reason": "hot_tracker.disabled",
+        }
+
     db = get_db()
 
     # ── Load keywords for this date ──

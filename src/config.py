@@ -7,6 +7,7 @@ All paths and secrets are accessed through this module.
 
 from pathlib import Path
 from functools import lru_cache
+from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -82,3 +83,37 @@ def get_settings() -> Settings:
 
 # Convenience accessor
 settings = get_settings()
+
+
+@lru_cache
+def _load_competitor_config() -> dict[str, Any]:
+    """Load optional project feature flags from competitor_list.yaml."""
+    try:
+        import yaml
+
+        path = settings.competitor_list_path
+        if not path.exists():
+            return {}
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def is_hot_tracker_enabled() -> bool:
+    """Whether Hot Tracker should run and render."""
+    cfg = _load_competitor_config().get("hot_tracker", {})
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("enabled", False))
+
+
+def is_hot_tracker_required() -> bool:
+    """Whether Hot Tracker failure should fail the pipeline."""
+    if not is_hot_tracker_enabled():
+        return False
+    cfg = _load_competitor_config().get("hot_tracker", {})
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("required", False))
