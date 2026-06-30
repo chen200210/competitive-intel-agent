@@ -1,6 +1,6 @@
 # Bug 日志
 
-> 记录项目中的已知 bug，按严重度排序。最后更新：2026-06-25 (P0+P1 Calibrator + β-Fusion + code review)
+> 记录项目中的已知 bug，按严重度排序。最后更新：2026-06-26 (#13 E2+E3+错误通道一致性修复)
 
 ---
 
@@ -11,6 +11,60 @@
 ---
 
 ## 🟢 已修复
+
+### BUG #E2: `taptap_resolver.py` Playwright 资源泄漏风险（HIGH）
+
+**发现**: 2026-06-25 面试评审 | **修复日期**: 2026-06-26
+
+`resolve_taptap_url()` 中 `context.close()` 不在 `finally` 块中。如果 `page.goto()` 或 click 操作抛异常，浏览器 context 不会被关闭。虽然 `sync_playwright()` 上下文管理器在 driver 进程级别兜底清理，但 context 级别缺少优雅关闭。
+
+**修复**: `context.close()` 移入 `try/finally` 块（`taptap_resolver.py:67-89`）。`sync_playwright()` 作为第二层安全网。
+
+关联: [[audit-2026-06-25-engineering]] #E2, [[CLAUDE.md#13]]
+
+### BUG #E3: `_keyword_in_text()` 无单词边界检查导致误分类（MEDIUM）
+
+**发现**: 2026-06-25 面试评审 | **修复日期**: 2026-06-26
+
+`track_filter.py:_keyword_in_text()` 纯子串匹配导致 "TD" 误匹配 "WTD"、"GTD" 等，将非塔防游戏误分类为赛道游戏。
+
+**修复**:
+- 纯 ASCII 关键词（`kw.isascii() and kw.isalpha()`）→ `\b` 单词边界 + `re.ASCII` flag
+- **`re.ASCII` 是必须的**: Python 默认 Unicode 模式将 CJK 字符视为 `\w`，导致 `\bTD\b` 无法匹配 "塔防TD手游"。`calibrator.py:_match_topic()` 已正确处理（`flags=re.ASCII` + 注释）
+- 混合关键词（"幸存者like"）→ 子串匹配，避免 `\b` 在 CJK/ASCII 边界失效
+
+关联: [[audit-2026-06-25-engineering]] #E3, [[CLAUDE.md#13]]
+
+### BUG #E4: `_shown_games_cache` 模块级全局可变状态 — 竞态条件（MEDIUM）
+
+**发现**: 2026-06-25 面试评审 | **修复日期**: 2026-06-26
+
+`_shown_games_cache` 模块级可变字典已在 briefer 拆分重构中移除，缓存逻辑整合到 `Database` 调用中，不再使用模块级全局状态。
+
+### BUG #E5: 延迟导入打破循环依赖 — 架构坏味道（MEDIUM）
+
+**发现**: 2026-06-25 面试评审 | **修复日期**: 2026-06-26
+
+全项目 ~114 处函数内 `from src.xxx import yyy`。审计文档原以为是"打破循环依赖"，实际分析发现 briefer 拆分后**已无跨模块循环依赖**——这些延迟导入是拆分时从原 1263 行单文件带过来的惯性写法。
+
+**修复**: ~22 处延迟导入提至模块顶层，覆盖 briefer/render/scorer/market_pipeline/dedup/enrichment/hot_tracker 共 7 个文件。仅保留 3 类合法内联：惰性加载（get_db/settings）、优雅降级（try/except ImportError）、CLI 入口（`if __name__`）。
+
+关联: [[audit-2026-06-25-engineering]] #E5, [[CLAUDE.md#13]]
+
+`_shown_games_cache` 模块级可变字典已在 briefer 拆分重构中移除，缓存逻辑整合到 `Database` 调用中，不再使用模块级全局状态。
+
+### BUG #E1: 全项目 ~55 处 `except Exception: pass` 系统性静默吞异常（CRITICAL）
+
+**发现**: 2026-06-25 面试评审 | **修复日期**: 2026-06-26
+
+全项目 22 个 Python 文件共 ~63 处裸 `except Exception:` / `except Exception: pass` 改为 `except Exception as e:` + `print(f"  [WARN] ...: {e}", file=sys.stderr)`。覆盖关键路径：
+- DB 写入 (sqlite.py 3 处) · 标签持久化 (briefer.py) · 去重读写 (dedup.py 8 处)
+- AI 打分兜底 (scorer.py 5 处) · 管道监控记录 (runner.py 2 处) · 热点追踪 (hot_tracker.py 8 处)
+- 所有 5 个 scraper 文件同步修复
+
+修复后全项目 `src/` + `tools/` 目录 0 处裸 `except Exception:`，124 处带 `file=sys.stderr` 日志的异常处理。
+
+关联: [[code-review-2026-06-26-e1-followup]] — code review 发现并修复了 7 个追尾问题（DB 写入失败误报 OK、stdout/stderr 混用、消息 typo 等）。
 
 ### BUG #C1: Calibrator system prompt 占位符从未被替换（CRITICAL）
 

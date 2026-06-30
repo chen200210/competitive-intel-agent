@@ -25,6 +25,8 @@ from pydantic import BaseModel
 from src.agents.base import Agent
 from src.pipeline.source_constants import is_bilibili, is_overseas, NewsSource
 from src.types import EnrichedNewsItem, ScoredNewsItem
+from src.pipeline.token_utils import _RE_GAME_NAMES
+from src.pipeline.source_constants import normalize_source
 
 
 # ═════════════════════════════════════════════════════════════
@@ -846,9 +848,6 @@ def _select_top_n(
 
     Returns items in score-descending order subject to caps.
     """
-    from src.pipeline.token_utils import _RE_GAME_NAMES
-    from src.pipeline.source_constants import normalize_source
-
     scored_items.sort(key=lambda x: x[1], reverse=True)
 
     def _extract_game(headline: str) -> str:

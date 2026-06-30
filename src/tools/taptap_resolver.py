@@ -64,28 +64,29 @@ def resolve_taptap_url(game_name: str, force: bool = False) -> str | None:
                 viewport={"width": 1280, "height": 800},
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            page = context.new_page()
-
-            page.goto(
-                f"https://www.taptap.cn/search?q={game_name}",
-                wait_until="networkidle", timeout=20_000,
-            )
-            page.wait_for_timeout(2_000)
-
-            # TapTap renders results in virtual DOM — click first game icon
-            # to trigger navigation, then read the URL for the app ID.
-            app_id: str | None = None
             try:
-                page.locator("img[alt]").first.click(timeout=5_000)
-                page.wait_for_timeout(2_000)
-                match = re.search(r'/app/(\d+)', page.url)
-                if match:
-                    app_id = match.group(1)
-            except Exception as e:
-                print(f"  [WARN] Playwright click/app_id extract failed for {game_name}: {e}", file=sys.stderr)
-                pass
+                page = context.new_page()
 
-            context.close()
+                page.goto(
+                    f"https://www.taptap.cn/search?q={game_name}",
+                    wait_until="networkidle", timeout=20_000,
+                )
+                page.wait_for_timeout(2_000)
+
+                # TapTap renders results in virtual DOM — click first game icon
+                # to trigger navigation, then read the URL for the app ID.
+                app_id: str | None = None
+                try:
+                    page.locator("img[alt]").first.click(timeout=5_000)
+                    page.wait_for_timeout(2_000)
+                    match = re.search(r'/app/(\d+)', page.url)
+                    if match:
+                        app_id = match.group(1)
+                except Exception as e:
+                    print(f"  [WARN] Playwright click/app_id extract failed for {game_name}: {e}", file=sys.stderr)
+                    pass
+            finally:
+                context.close()
 
             if app_id:
                 app_url = f"https://www.taptap.cn/app/{app_id}"

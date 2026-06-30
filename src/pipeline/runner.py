@@ -478,6 +478,13 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
     print(f"{'='*50}")
 
     db = get_db()
+    try:
+        with db._connect() as conn:
+            conn.execute("DELETE FROM hot_topic_news WHERE date = ?", (date,))
+            conn.commit()
+        print("  [CLEAN] Cleared today's hot topic results")
+    except Exception as e:
+        print(f"  [WARN] Failed to clear today's hot topics: {e}")
 
     # ── Phase 0.5: Re-collect hot keywords (afternoon trends differ from morning) ──
     print("\n── Hot Keywords (re-collect) ──")
@@ -518,9 +525,11 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
             source = item.get("source", "") or item.get("search_engine", "")
             score = item.get("value_score", "?")
             summary = item.get("ai_summary", "") or item.get("snippet", "") or ""
+            url = item.get("url", "") or "(no url)"
             summary_short = summary[:100] + "…" if len(summary) > 100 else summary
             print(f"  {i}. [{score}] {headline}")
             print(f"     {source} — {summary_short}")
+            print(f"     URL: {url}")
 
     # ── Build standalone hot-topic card ──
     now = _dt.now().strftime("%H:%M")
@@ -569,6 +578,63 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
     }
 
 
+def _print_deep_research_report(result: dict[str, Any]) -> None:
+    """Pretty-print a Deep Research report to the terminal.
+
+    Shows the 500-word markdown report prominently, followed by
+    key findings, confidence, and citations.
+    """
+    if not result.get("success"):
+        print(f"\n[FAIL] Deep Research failed: {result.get('error', 'unknown')}")
+        return
+
+    report_md = result.get("report_md", "")
+    key_findings = result.get("key_findings", [])
+    citations = result.get("citations", [])
+    confidence = result.get("confidence", "medium")
+    cached = result.get("cached", False)
+    topic = result.get("topic", "")
+
+    confidence_label = {"high": "🟢 高", "medium": "🟡 中", "low": "🔴 低"}.get(
+        confidence, f"🟡 {confidence}"
+    )
+
+    print()
+    print("=" * 64)
+    print(f"  🔬 深度研究报告")
+    print(f"  话题: {topic}")
+    print(f"  置信度: {confidence_label}" + ("  (缓存)" if cached else ""))
+    print("=" * 64)
+    print()
+    print(report_md)
+    print()
+
+    if key_findings:
+        print("─" * 48)
+        print("  💡 核心发现")
+        for i, f in enumerate(key_findings, 1):
+            print(f"    {i}. {f}")
+        print()
+
+    if citations:
+        print("─" * 48)
+        print(f"  📎 引用来源 ({len(citations)} 条)")
+        for i, c in enumerate(citations[:10], 1):
+            url = c.get("url", "")
+            title = c.get("title", "") or url
+            verified = "✅" if c.get("verified") else "⏳"
+            print(f"    {i}. {verified} {title}")
+            if url:
+                print(f"       {url}")
+        print()
+
+    print("─" * 48)
+    print(f"  report_id: {result.get('report_id', 'N/A')}")
+    if result.get("push_success"):
+        print(f"  已推送到飞书 ✅")
+    print("=" * 64)
+
+
 # ═════════════════════════════════════════════════════════════
 # CLI
 # ═════════════════════════════════════════════════════════════
@@ -594,6 +660,8 @@ if __name__ == "__main__":
                         help="Days of feedback to analyze for calibration (default 14)")
     parser.add_argument("--hot-only", action="store_true",
                         help="Afternoon hot-topic refresh only (re-collect keywords, re-search, push standalone card)")
+    parser.add_argument("--deep-research", type=str, default=None, metavar="QUESTION",
+                        help="Run Deep Research Agent on a topic (e.g. 'AI+游戏 2026趋势')")
     args = parser.parse_args()
 
     date_arg = args.date
@@ -607,6 +675,21 @@ if __name__ == "__main__":
         if args.brief_only:
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         sys.exit(0)
+
+    # ── Deep Research (standalone — runs instead of pipeline) ──
+    if args.deep_research:
+        from src.agents.deep_researcher import run_deep_research
+        dr_result = run_deep_research(
+            question=args.deep_research,
+            date=date_arg,
+            push_chat_id=args.push,
+            verbose=args.verbose,
+        )
+        if args.brief_only:
+            print(json.dumps(dr_result, ensure_ascii=False, indent=2, default=str))
+        else:
+            _print_deep_research_report(dr_result)
+        sys.exit(0 if dr_result.get("success") else 1)
 
     # ── Calibrator (standalone — runs instead of pipeline) ──
     if args.calibrate:

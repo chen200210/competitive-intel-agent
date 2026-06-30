@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     bing_search_api_key: str = ""
     serpapi_key: str = ""
+    bocha_api_key: str = ""
+    bocha_base_url: str = ""
 
     # ── Database ───────────────────────────────────────────
     sqlite_path: str = str(PROJECT_ROOT / "data" / "intel.db")

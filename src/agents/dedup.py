@@ -24,6 +24,8 @@ import re
 import sys
 from typing import Any
 
+from src.pipeline.token_utils import headline_dedup_tokens as _fn
+
 
 # ═════════════════════════════════════════════════════════════
 # News dedup
@@ -60,7 +62,6 @@ def headline_dedup_tokens(headline: str) -> set[str]:
     Returns a set of normalized key phrases. If ANY token from a new headline
     matches ANY token from a previously reported headline, it's a duplicate.
     """
-    from src.pipeline.token_utils import headline_dedup_tokens as _fn
     return _fn(headline)
 
 
@@ -78,7 +79,7 @@ def save_reported_news(urls: set[str], date: str,
             if n:
                 print(f"   DB: marked {n} news URLs as reported")
         except Exception as e:
-            print(f"   [warn] DB news reported save failed: {e}")
+            print(f"   [WARN] DB news reported save failed: {e}", file=sys.stderr)
 
     # Save headline dedup tokens for cross-source dedup
     if headline_tokens:
@@ -90,7 +91,7 @@ def save_reported_news(urls: set[str], date: str,
             if n:
                 print(f"   DB: marked {n} headline tokens as reported")
         except Exception as e:
-            print(f"   [warn] DB headline tokens save failed: {e}")
+            print(f"   [WARN] DB headline tokens save failed: {e}", file=sys.stderr)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -132,7 +133,7 @@ def save_reported_steam(names: set[str], date: str) -> None:
         if n:
             print(f"   DB: marked {n} steam games as reported")
     except Exception as e:
-        print(f"   [warn] DB steam reported save failed: {e}")
+        print(f"   [WARN] DB steam reported save failed: {e}", file=sys.stderr)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -175,4 +176,4 @@ def save_reported_taptap(names: set[str], date: str) -> None:
         if n:
             print(f"   DB: marked {n} taptap games as reported")
     except Exception as e:
-        print(f"   [warn] DB reported save failed: {e}")
+        print(f"   [WARN] DB taptap reported save failed: {e}", file=sys.stderr)

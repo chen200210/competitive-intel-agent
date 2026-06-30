@@ -35,6 +35,43 @@ _NOISE_CHINESE_GENERIC = {
 }
 
 
+def ascii_word_match(keyword: str, text: str) -> bool:
+    """Match *keyword* in *text*, using word boundaries for pure-ASCII tokens.
+
+    Short ASCII keywords like "TD", "AI", "IP" would false-match as substrings
+    inside longer words ("WTD", "train", "chip").  This function applies
+    ``\\b`` + ``re.ASCII`` for any keyword that is pure-ASCII alphabetic,
+    preventing those false positives while keeping plain substring matching
+    for CJK and mixed keywords where ``\\b`` is unreliable.
+
+    **MUST use re.ASCII**: in Python's default Unicode mode, CJK characters
+    are ``\\w``, so ``\\bTD\\b`` would NOT match "塔防TD手游" (no boundary
+    between 防(\\w) and T(\\w)).  With ``re.ASCII``, only ``[a-zA-Z0-9_]``
+    are ``\\w``, so 防→T creates a word boundary.
+
+    Args:
+        keyword: The keyword to search for.
+        text:    The text to search in.
+
+    Returns:
+        True if *keyword* matches in *text*.
+    """
+    if not keyword or not keyword.strip():
+        return False
+
+    kw_lower = keyword.lower()
+    text_lower = text.lower()
+
+    # Fast path: plain substring for CJK / mixed keywords
+    if not (kw_lower.isascii() and kw_lower.isalpha()):
+        return kw_lower in text_lower
+
+    # Pure-ASCII keyword → \b with re.ASCII prevents substring false positives
+    return bool(
+        re.search(r'\b' + re.escape(kw_lower) + r'\b', text_lower, flags=re.ASCII)
+    )
+
+
 def extract_game_names(headline: str) -> set[str]:
     """Extract game names from 《》 brackets in a headline."""
     return set(_RE_GAME_NAMES.findall(headline))

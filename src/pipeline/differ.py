@@ -18,14 +18,6 @@ from src.storage.sqlite import get_db
 from src.types import RankingEntry, ChangeRecord
 
 
-# ── Configurable thresholds ──────────────────────────────────
-
-# Monitored bundle IDs that get a priority boost (loaded from YAML at runtime,
-# hard-coded placeholder list here for standalone testability).
-MONITORED_HIGH_PRIORITY: set[str] = set()
-
-
-
 # ── Attention Score ──────────────────────────────────────────
 
 def compute_attention_score(
@@ -33,7 +25,6 @@ def compute_attention_score(
     today_rank: int | None,
     yesterday_rank: int | None,
     rank_change: int | None,
-    bundle_id: str,
     game_name: str = "",
 ) -> float:
     """
@@ -44,8 +35,7 @@ def compute_attention_score(
       2. Change type (new_entry / dropped_out > rank move)
       3. Magnitude of change (big jumps = high attention)
       4. Breakout bonus (jumping from low rank is a stronger signal)
-      5. Priority watchlist bonus
-      6. Track relevance bonus (赛道游戏 +1.5)
+      5. Track relevance bonus (赛道游戏 +1.5)
     """
     score = 0.0
 
@@ -111,11 +101,7 @@ def compute_attention_score(
         if yr > 50 and delta >= 5:
             score += 1.0
 
-    # ── 5. Priority watchlist ──
-    if bundle_id in MONITORED_HIGH_PRIORITY:
-        score += 1.0
-
-    # ── 6. Track relevance bonus ──
+    # ── 5. Track relevance bonus ──
     if game_name:
         try:
             from src.pipeline.track_filter import classify_game
@@ -234,7 +220,7 @@ def _diff_one_chart(
             continue  # no change record needed for stable
 
         attention_score = compute_attention_score(
-            change_type, today_rank, yesterday_rank, rank_change, bundle_id,
+            change_type, today_rank, yesterday_rank, rank_change,
             game_name=t.get("game_name", ""),
         )
 
@@ -262,7 +248,7 @@ def _diff_one_chart(
                 overview["big_moves"] += 1
 
             attention_score = compute_attention_score(
-                "dropped_out", None, yesterday_rank, None, bundle_id
+                "dropped_out", None, yesterday_rank, None
             )
 
             changes.append({
@@ -375,7 +361,6 @@ def diff_with_yesterday(date: str) -> dict[str, Any]:
 # ── CLI test entry ───────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
     import json
 
     date_arg = sys.argv[2] if len(sys.argv) >= 4 and sys.argv[1] == "--date" else None

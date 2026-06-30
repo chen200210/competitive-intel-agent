@@ -15,6 +15,7 @@ from typing import Any
 
 from src.pipeline.source_constants import is_bilibili
 from src.types import ScoredNewsItem
+from src.tools.image_fetch import image_fetch as do_image_fetch
 
 
 # ═════════════════════════════════════════════════════════════
@@ -151,8 +152,6 @@ def enrich_news_images(
     Returns:
         The same list, mutated in place with image_url populated.
     """
-    from src.tools.image_fetch import image_fetch as do_image_fetch
-
     fetched = 0
     for item in news_items:
         # Skip items that already have an image (B站 covers)

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grep -qiE '/interrogate|审[问查]|面试|边界检查|设计审查' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"执行需求审问流程：1)Read设计文档 2)通读所有相关源码(DB schema/调用链/bot回调/configs) 3)按边界/异常/依赖/时序四维深挖 4)按CRITICAL/HIGH/MEDIUM/LOW分级，每项含根因(file:line)+影响面(表格)+修复代码 5)追加到设计文档末尾(## 设计审问) 6)输出优先级汇总表。自检：列名冲突/去重约束/事务边界/双重计数/回调闭环/CLI flags/时间格式一致性。\"}}' || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

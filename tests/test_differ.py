@@ -60,31 +60,31 @@ check("zero changes", classify_day(100, up=0, down=0, new_entry=0, dropped_out=0
 print("\n── compute_attention_score ──")
 
 # Top 10 new entry → 2.0(band) + 2.0(type) + 3.0(top10) = 7.0
-s = compute_attention_score("new_entry", today_rank=7, yesterday_rank=None, rank_change=None, bundle_id="com.test.a")
+s = compute_attention_score("new_entry", today_rank=7, yesterday_rank=None, rank_change=None)
 check("new_entry top10 rank#7", round(s, 1), 7.0)
 
 # New entry at #55 → 0.2(band) + 2.0(type) = 2.2
-s = compute_attention_score("new_entry", today_rank=55, yesterday_rank=None, rank_change=None, bundle_id="com.test.b")
+s = compute_attention_score("new_entry", today_rank=55, yesterday_rank=None, rank_change=None)
 check("new_entry rank#55", round(s, 1), 2.2)
 
 # Top 5 small move → 5.0(band) + 1.5(head_move) + 0.3(small) = 6.8
-s = compute_attention_score("up", today_rank=2, yesterday_rank=3, rank_change=1, bundle_id="com.test.c")
+s = compute_attention_score("up", today_rank=2, yesterday_rank=3, rank_change=1)
 check("top5 up +1", round(s, 1), 6.8)
 
 # Big jump from low rank → 1.0(band≤30) + 3.5(≥20) + 2.0(breakout>30) = 6.5
-s = compute_attention_score("up", today_rank=15, yesterday_rank=37, rank_change=22, bundle_id="com.test.d")
+s = compute_attention_score("up", today_rank=15, yesterday_rank=37, rank_change=22)
 check("big_jump +22 breakout", round(s, 1), 6.5)
 
 # Small move at low rank → 0.2(band>50) + 0.3(small) = 0.5
-s = compute_attention_score("up", today_rank=75, yesterday_rank=78, rank_change=3, bundle_id="com.test.e")
+s = compute_attention_score("up", today_rank=75, yesterday_rank=78, rank_change=3)
 check("low_rank small +3", round(s, 1), 0.5)
 
 # Dropped from top 5 → 3.5(band≤5) + 4.0(≤10) = 7.5
-s = compute_attention_score("dropped_out", today_rank=None, yesterday_rank=5, rank_change=None, bundle_id="com.test.f")
+s = compute_attention_score("dropped_out", today_rank=None, yesterday_rank=5, rank_change=None)
 check("dropped_out from #5", round(s, 1), 7.5)
 
 # Dropped from #80 → 0.2(band>50) + 0.5(else) = 0.7
-s = compute_attention_score("dropped_out", today_rank=None, yesterday_rank=80, rank_change=None, bundle_id="com.test.g")
+s = compute_attention_score("dropped_out", today_rank=None, yesterday_rank=80, rank_change=None)
 check("dropped_out from #80", round(s, 1), 0.7)
 
 

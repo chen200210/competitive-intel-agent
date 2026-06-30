@@ -18,6 +18,9 @@ from collections.abc import Callable
 from typing import Any
 
 from src.types import NewGameEntry, ChangeRecord, ScoredNewsItem, HotTopicItem
+from src.agents.enrichment import enrich_news_images as _enrich_images
+from src.feishu.card_builder import build_news_feedback_actions, build_hot_topic_click_action
+from src.tools.url_utils import extract_domain
 
 
 # ═════════════════════════════════════════════════════════════
@@ -282,9 +285,6 @@ def build_market_elements(
     Returns:
         List of card elements (markdown + optional img + feedback per entry).
     """
-    from src.agents.enrichment import enrich_news_images as _enrich_images
-    from src.feishu.card_builder import build_news_feedback_actions
-
     # Pre-fill og:image for news items that don't have it yet
     _enrich_images(top_news)
 
@@ -322,7 +322,7 @@ def build_market_elements(
 
         img_url = url_to_image.get(entry_url, "")
         if img_url:
-            from src.feishu.pusher import upload_image
+            from src.feishu.pusher import upload_image  # lazy — avoids lark_oapi dep for non-push usage
             result = upload_image(img_url)
             if result.get("success"):
                 elements.append({
@@ -359,8 +359,6 @@ def build_hot_topics_md(
     Returns:
         Markdown string for the Feishu card hot topics section.
     """
-    from src.tools.url_utils import extract_domain
-
     lines: list[str] = []
 
     if not hot_items:
@@ -418,8 +416,6 @@ def build_hot_topic_elements(
     Returns:
         List of card elements with per-item click tracking buttons.
     """
-    from src.feishu.card_builder import build_hot_topic_click_action
-
     # Build URL → keyword lookup from hot_items
     url_to_keyword: dict[str, str] = {}
     for item in hot_items:

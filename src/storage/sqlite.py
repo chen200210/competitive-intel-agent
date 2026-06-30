@@ -275,6 +275,26 @@ CREATE INDEX IF NOT EXISTS idx_hot_topic_news_selected ON hot_topic_news(date, s
 -- Feedback queries always filter on date or target_date (daily + weekly paths)
 CREATE INDEX IF NOT EXISTS idx_user_feedback_date ON user_feedback(date);
 CREATE INDEX IF NOT EXISTS idx_user_feedback_target_date ON user_feedback(target_date);
+CREATE INDEX IF NOT EXISTS idx_user_feedback_type_kw_date ON user_feedback(feedback_type, keyword, date);
+
+-- Deep research reports (500-word cited briefs, one per topic per day)
+CREATE TABLE IF NOT EXISTS deep_research_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,               -- trigger date (YYYY-MM-DD)
+    topic TEXT NOT NULL,              -- research question
+    sub_questions_json TEXT,          -- ["sub-q1", "sub-q2", ...]
+    report_md TEXT NOT NULL,          -- 500-word cited markdown
+    citations_json TEXT,              -- [{"url":..., "title":..., "verified":bool, "claim":...}, ...]
+    source_hot_topic_url TEXT,        -- which hot_topic_news.url triggered this
+    triggered_by TEXT DEFAULT 'manual', -- 'manual' | 'auto' (>=3 clicks)
+    chat_id TEXT DEFAULT '',
+    pushed BOOLEAN DEFAULT 0,
+    confidence TEXT DEFAULT 'medium',    -- high | medium | low
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, topic)
+);
+CREATE INDEX IF NOT EXISTS idx_dr_date ON deep_research_reports(date);
+CREATE INDEX IF NOT EXISTS idx_dr_topic ON deep_research_reports(topic);
 
 -- Calibration parameters (versioned, produced by Calibrator agent)
 CREATE TABLE IF NOT EXISTS calibration_params (
@@ -311,6 +331,7 @@ class Database:
         self._migrate_v10()
         self._migrate_v11()
         self._migrate_v12()
+        self._migrate_v13()
 
     # ── Connection ──────────────────────────────────────────
 
@@ -560,6 +581,23 @@ class Database:
             if "value_score" not in existing:
                 conn.execute("ALTER TABLE hot_topic_news ADD COLUMN value_score INTEGER DEFAULT 0")
                 print("[migrate] Added value_score to hot_topic_news")
+
+    def _migrate_v13(self) -> None:
+        """Add confidence column to deep_research_reports."""
+        with self._connect() as conn:
+            # Check table exists first (may not exist on very old databases)
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "deep_research_reports" not in tables:
+                return
+            existing = {row[1] for row in conn.execute(
+                "PRAGMA table_info('deep_research_reports')").fetchall()}
+            if "confidence" not in existing:
+                conn.execute(
+                    "ALTER TABLE deep_research_reports "
+                    "ADD COLUMN confidence TEXT DEFAULT 'medium'"
+                )
+                print("[migrate] Added confidence to deep_research_reports")
 
     # ── Calibration CRUD ─────────────────────────────────────
 
@@ -1280,6 +1318,98 @@ class Database:
                 (date, target_date, chat_id, news_url, keyword, open_id),
             )
             return "inserted" if cur.rowcount > 0 else "duplicate"
+
+    # ── Deep Research Reports ─────────────────────────────────
+
+    def insert_deep_research_report(
+        self,
+        date: str,
+        topic: str,
+        sub_questions_json: str,
+        report_md: str,
+        citations_json: str,
+        source_hot_topic_url: str = "",
+        triggered_by: str = "manual",
+        chat_id: str = "",
+        confidence: str = "medium",
+    ) -> int:
+        """Insert or replace a deep research report. Returns row id."""
+        sql = """
+            INSERT OR REPLACE INTO deep_research_reports
+                (date, topic, sub_questions_json, report_md, citations_json,
+                 source_hot_topic_url, triggered_by, chat_id, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                sql,
+                (date, topic, sub_questions_json, report_md, citations_json,
+                 source_hot_topic_url, triggered_by, chat_id, confidence),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_deep_research_report(self, date: str, topic: str) -> dict[str, Any] | None:
+        """Get a single deep research report by date + topic (idempotency check)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM deep_research_reports WHERE date = ? AND topic = ?",
+                (date, topic),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_deep_research_reports_by_date(self, date: str) -> list[dict[str, Any]]:
+        """Get all deep research reports for a given date."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM deep_research_reports WHERE date = ? ORDER BY id",
+                (date,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_topic_click_count(self, keyword: str, since_date: str) -> int:
+        """Return distinct user click count for a topic keyword since a date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(DISTINCT open_id) as cnt FROM user_feedback
+                   WHERE feedback_type = 'hot_click'
+                     AND keyword = ?
+                     AND open_id != ''
+                     AND date >= ?""",
+                (keyword, since_date),
+            ).fetchone()
+        return row["cnt"] if row else 0
+
+    def get_topic_clickers(self, keyword: str, since_date: str) -> list[str]:
+        """Return open_ids of users who clicked '感兴趣' on a topic since since_date."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT open_id FROM user_feedback
+                   WHERE feedback_type = 'hot_click'
+                     AND keyword = ?
+                     AND open_id != ''
+                     AND date >= ?""",
+                (keyword, since_date),
+            ).fetchall()
+        return [r["open_id"] for r in rows]
+
+    def mark_deep_research_pushed(self, report_id: int) -> None:
+        """Mark a deep research report as pushed to Feishu."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE deep_research_reports SET pushed = 1 WHERE id = ?",
+                (report_id,),
+            )
+            conn.commit()
+
+    def delete_deep_research_report(self, date: str, topic: str) -> None:
+        """Delete a deep research report (for manual cleanup)."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM deep_research_reports WHERE date = ? AND topic = ?",
+                (date, topic),
+            )
+            conn.commit()
 
     def get_hot_keyword_click_stats(self, days: int = 14) -> dict[str, int]:
         """Get click counts per keyword from hot_click feedback (last N days)."""

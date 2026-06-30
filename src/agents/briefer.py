@@ -35,6 +35,21 @@ from src.types import (
     BriefContext, BilibiliVideo, RawNewsItem,
 )
 
+from src.agents.dedup import (
+    save_reported_news, headline_dedup_tokens,
+    load_reported_steam, save_reported_steam,
+    load_reported_taptap, save_reported_taptap,
+)
+from src.agents.market_pipeline import filter_news, apply_fatigue, deep_fetch
+from src.agents.render import (
+    build_new_games_md, build_ranking_md, build_market_elements,
+    build_hot_topics_md, build_hot_topic_elements, _parse_downloads,
+)
+from src.agents.scorer import ai_summarize_and_judge
+from src.pipeline.differ import classify_day
+from src.pipeline.track_filter import filter_track_changes, classify_game
+from src.tools.taptap_resolver import fuzzy_match_game_name
+
 
 def brief(
     date: str,
@@ -74,14 +89,6 @@ def brief(
     Returns:
         Feishu card JSON dict with msg_type and card.
     """
-    from src.agents.render import build_new_games_md, build_ranking_md, build_market_elements
-    from src.agents.render import build_hot_topics_md, build_hot_topic_elements
-    from src.agents.market_pipeline import filter_news, apply_fatigue, deep_fetch
-    from src.agents.scorer import ai_summarize_and_judge
-    from src.agents.dedup import (
-        save_reported_news, headline_dedup_tokens,
-    )
-
     # ── Build new games + ranking markdown in code (zero AI) ──
     new_games_md = build_new_games_md(
         steam_ports or [], taptap_games or [],
@@ -255,6 +262,8 @@ def brief(
         )
     except Exception as e:
         print(f"  [WARN] Failed to save report to DB: {e}", file=sys.stderr)
+        if warnings is not None:
+            warnings.append(f"Briefer DB save failed: {e}")
 
     card_data["_run_id"] = run_id
     return card_data
@@ -274,13 +283,6 @@ def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None =
         Feishu card JSON dict.
     """
     from src.storage.sqlite import get_db
-    from src.pipeline.differ import classify_day
-    from src.pipeline.track_filter import filter_track_changes
-    from src.agents.dedup import (
-        load_reported_steam, save_reported_steam,
-        load_reported_taptap, save_reported_taptap,
-    )
-    from src.agents.render import _parse_downloads, build_hot_topics_md
 
     db = get_db()
 
@@ -367,7 +369,6 @@ def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None =
     # Prepend them so they survive the [:12] slice in build_ranking_md() — force-
     # included games must appear before any track-filtered entries get trimmed.
     if yesterday_new_games:
-        from src.tools.taptap_resolver import fuzzy_match_game_name
         existing_names = {c.get("game_name", "") for c in sector_changes}
         extras: list[dict[str, Any]] = []
         for c in changes:
@@ -413,8 +414,6 @@ def _yesterday_shown_games(db, yesterday_str: str) -> set[str]:
     Does NOT replicate cross-day dedup (can't reconstruct past dedup state),
     so this is a slight over-approximation — acceptable for the badge.
     """
-    from src.agents.render import _parse_downloads
-
     shown: set[str] = set()
 
     # TapTap selection
@@ -443,13 +442,8 @@ def _bilibili_to_news(videos: list[BilibiliVideo]) -> list[RawNewsItem]:
     """Convert bilibili_videos rows into market_news-compatible format.
 
     Runs track_filter on each video title to determine relevance.
+    classify_game is imported at module level (line 50) — no lazy fallback needed.
     """
-    try:
-        from src.pipeline.track_filter import classify_game
-    except Exception as e:
-        print(f"  [WARN] track_filter import failed, B站 videos will not be classified: {e}", file=sys.stderr)
-        classify_game = None
-
     news_items = []
     for v in videos:
         label = v.get("creator_label", "")
@@ -459,17 +453,16 @@ def _bilibili_to_news(videos: list[BilibiliVideo]) -> list[RawNewsItem]:
 
         # Run track_filter on title + tags + subtitle
         track = False
-        if classify_game:
-            try:
-                tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
-                result = classify_game(
-                    game_name=title,
-                    tags=tag_list if tag_list else None,
-                    description=subtitle[:500] if subtitle else "",
-                )
-                track = result == "track"
-            except Exception as e:
-                print(f"  [WARN] track_filter.classify_game failed for '{title[:40]}': {e}", file=sys.stderr)
+        try:
+            tag_list = [t.strip() for t in tags_str.split(",") if t.strip()]
+            result = classify_game(
+                game_name=title,
+                tags=tag_list if tag_list else None,
+                description=subtitle[:500] if subtitle else "",
+            )
+            track = result == "track"
+        except Exception as e:
+            print(f"  [WARN] track_filter.classify_game failed for '{title[:40]}': {e}", file=sys.stderr)
 
         headline = f"[B站·{label}] {title}"
         news_items.append({

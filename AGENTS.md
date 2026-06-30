@@ -1,4 +1,4 @@
-# CLAUDE.md — 技术速查表
+# AGENTS.md — 技术速查表
 
 ## 目录地图
 

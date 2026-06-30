@@ -77,7 +77,7 @@ class NewsFeeds(ChartScraper):
             print(f"  {len(news17173)} 条头条")
             all_news.extend(news17173)
         except Exception as e:
-            print(f"  [WARN] 17173 抓取失败: {e}")
+            print(f"  [WARN] 17173 抓取失败: {e}", file=sys.stderr)
 
         # ═══ Source 3: 3DM ═══
         print("── 3DM (3dmgame.com) ──")
@@ -86,7 +86,7 @@ class NewsFeeds(ChartScraper):
             print(f"  {len(news_3dm)} 条头条")
             all_news.extend(news_3dm)
         except Exception as e:
-            print(f"  [WARN] 3DM 抓取失败: {e}")
+            print(f"  [WARN] 3DM 抓取失败: {e}", file=sys.stderr)
 
         # ═══ Source 4: 游戏陀螺 ═══
         print("── 游戏陀螺 (youxituoluo.com) ──")
@@ -95,7 +95,7 @@ class NewsFeeds(ChartScraper):
             print(f"  {len(news_tuoluo)} 条头条")
             all_news.extend(news_tuoluo)
         except Exception as e:
-            print(f"  [WARN] 游戏陀螺抓取失败: {e}")
+            print(f"  [WARN] 游戏陀螺抓取失败: {e}", file=sys.stderr)
 
         # ═══ Source 5: 游戏日报 ═══
         print("── 游戏日报 (news.yxrb.net) ──")
@@ -104,7 +104,7 @@ class NewsFeeds(ChartScraper):
             print(f"  {len(news_yxrb)} 条头条")
             all_news.extend(news_yxrb)
         except Exception as e:
-            print(f"  [WARN] 游戏日报抓取失败: {e}")
+            print(f"  [WARN] 游戏日报抓取失败: {e}", file=sys.stderr)
 
         # ═══ Source 6: GameLook ═══
         print("── GameLook (gamelook.com.cn) ──")
@@ -113,7 +113,7 @@ class NewsFeeds(ChartScraper):
             print(f"  {len(news_gamelook)} 条头条")
             all_news.extend(news_gamelook)
         except Exception as e:
-            print(f"  [WARN] GameLook抓取失败: {e}")
+            print(f"  [WARN] GameLook抓取失败: {e}", file=sys.stderr)
 
         # ═══ Deduplicate by URL ═══
         seen_urls: set[str] = set()
@@ -595,7 +595,7 @@ def _sync_to_db(csv_path: Path, date: str) -> None:
         db.insert_market_news_deduped(records, date)
 
     except Exception as e:
-        print(f"  [WARN] DB sync failed: {e}")
+        print(f"  [WARN] DB sync failed: {e}", file=sys.stderr)
 
 
 # ── CLI ───────────────────────────────────────────────────────

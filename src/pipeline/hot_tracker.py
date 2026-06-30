@@ -22,6 +22,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as _date
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -42,13 +43,12 @@ UA = (
 
 # ── Curated persistent-interest keywords (game industry insider lens) ──
 CURATED_KEYWORDS: list[dict[str, Any]] = [
-    {"keyword": "AI技术 游戏", "source": "curated", "rank": 1},
-    {"keyword": "游戏引擎", "source": "curated", "rank": 2},
-    {"keyword": "游戏硬件 变革", "source": "curated", "rank": 3},
-    {"keyword": "游戏版号 审核", "source": "curated", "rank": 4},
-    {"keyword": "大厂动态 游戏", "source": "curated", "rank": 5},
+    {"keyword": "游戏公司 融资 并购", "source": "curated", "rank": 1},
+    {"keyword": "新游 测试 上线", "source": "curated", "rank": 2},
+    {"keyword": "游戏版号 审核", "source": "curated", "rank": 3},
+    {"keyword": "腾讯 网易 米哈游 游戏", "source": "curated", "rank": 4},
+    {"keyword": "工作室 合作 裁员 游戏", "source": "curated", "rank": 5},
 ]
-
 # Game/tech relevance signals for filtering hot topics
 GAME_SIGNALS: list[str] = [
     "游戏", "电竞", "手游", "端游", "主机", "Steam", "steam",
@@ -120,6 +120,8 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
     merged: dict[str, dict[str, Any]] = {}
     for kw in all_keywords:
         key = kw["keyword"]
+        if not _is_compact_topic_keyword(key, kw.get("source", "")):
+            continue
         if key in merged:
             # Keep the better rank
             if kw.get("rank", 99) < merged[key].get("rank", 99):
@@ -130,7 +132,7 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
     # ── Filter for game/tech relevance ──
     relevant: dict[str, dict[str, Any]] = {}
     for key, kw in merged.items():
-        if _is_game_relevant(key):
+        if kw.get("source") == "curated" or _is_game_relevant(key):
             relevant[key] = kw
 
     # If nothing relevant after filtering, keep curated at minimum
@@ -200,6 +202,9 @@ def collect_hot_keywords(date: str) -> dict[str, Any]:
             }
             for kw in keywords
         ]
+        with db._connect() as conn:
+            conn.execute("DELETE FROM hot_keywords WHERE date = ?", (date,))
+            conn.commit()
         db.insert_hot_keywords(records)
     except Exception as e:
         print(f"  [WARN] Failed to write hot keywords to DB: {e}", file=sys.stderr)
@@ -259,46 +264,76 @@ def _fetch_baidu_hotspots() -> list[dict[str, Any]]:
 
 
 def _fetch_zhihu_hotspots() -> list[dict[str, Any]]:
-    """Scrape Zhihu hot list for game/tech topics."""
-    try:
-        resp = httpx.get(
-            "https://www.zhihu.com/hot",
-            headers={"User-Agent": UA},
-            timeout=15.0,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  [WARN] Zhihu hotspot scrape failed: {e}", file=sys.stderr)
-        return []
+    """Discover Zhihu discussion signals via search-engine results.
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    Zhihu hot pages now return stable 403 for anonymous HTTP requests in this
+    environment. Instead of direct scraping, we search for recent Zhihu pages
+    about game-industry topics and extract compact discussion keywords from the
+    result titles. This preserves the "problem/discussion" signal without
+    introducing browser automation or login-state maintenance.
+    """
+    queries = [
+        'site:zhihu.com 游戏 行业',
+        'site:zhihu.com 游戏 AI',
+        'site:zhihu.com 游戏 版号',
+        'site:zhihu.com 游戏 公司',
+    ]
+
     results: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-    items = soup.select(".HotList-item, .HotItem, .List-item")
-    if not items:
-        items = soup.select("[data-za-detail-view-path-module]")
-
-    for idx, item in enumerate(items[:30]):
-        title_el = (
-            item.select_one(".HotList-itemTitle, h2, h3")
-            or item.select_one("a")
-        )
-        if not title_el:
-            continue
-        title = title_el.get_text(strip=True)
-        if not title or len(title) < 2:
-            continue
-        if not _is_game_relevant(title):
+    for query in queries:
+        try:
+            search_results = _search_with_fallback(query, max_results=5)
+        except Exception as e:
+            print(f"  [WARN] Zhihu discovery search failed for '{query}': {e}",
+                  file=sys.stderr)
             continue
 
-        results.append({
-            "keyword": _normalize_keyword(title),
-            "source": "zhihu",
-            "rank": idx + 1,
-        })
+        for item in search_results:
+            title = (item.get("title", "") or "").strip()
+            url = (item.get("url", "") or "").lower()
+            if not title or "zhihu.com" not in url:
+                continue
+            if not _is_game_relevant(title):
+                continue
+
+            title = _clean_zhihu_title(title)
+            if not title:
+                continue
+
+            # Prefer actual Zhihu questions over generic article/report pages.
+            is_question = "/question/" in url or title.endswith("?") or title.endswith("？")
+            if not is_question and any(mark in title for mark in ("如何", "怎么看", "为什么", "是否", "怎么")):
+                is_question = True
+            if not is_question and any(mark in url for mark in ("/p/", "/zvideo/")):
+                continue
+
+            kw = _normalize_keyword(title)
+            if not kw or kw in seen:
+                continue
+            if not _is_compact_topic_keyword(kw, "zhihu"):
+                continue
+
+            seen.add(kw)
+            results.append({
+                "keyword": kw,
+                "source": "zhihu",
+                "rank": len(results) + 1,
+            })
 
     return results
+
+
+def _clean_zhihu_title(title: str) -> str:
+    """Strip common Zhihu/search boilerplate from a result title."""
+    cleaned = title.strip()
+    cleaned = re.sub(r"\s*[-|_｜]\s*知乎.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*[-|_｜]\s*.*知乎.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b知乎\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b回答\b", "", cleaned)
+    cleaned = re.sub(r"\b文章\b", "", cleaned)
+    return cleaned.strip(" -|_｜")
 
 
 def _fetch_weibo_hotspots() -> list[dict[str, Any]]:
@@ -422,12 +457,307 @@ def _normalize_keyword(raw: str) -> str:
     return raw.strip()
 
 
+def _is_compact_topic_keyword(keyword: str, source: str) -> bool:
+    """Filter out long sentence-like pseudo-keywords from hot sources."""
+    if source == "curated":
+        return True
+
+    kw = (keyword or "").strip()
+    if not kw:
+        return False
+    if len(kw) > 14:
+        return False
+    if sum(ch.isdigit() for ch in kw) >= 4:
+        return False
+    if any(mark in kw for mark in "，。！？；：()（）[]【】/\\"):
+        return False
+    if kw.count(" ") >= 3:
+        return False
+    return True
+
+
+def _is_search_page_url(url: str) -> bool:
+    """Detect search engine result pages instead of article pages."""
+    if not url:
+        return True
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    return host in {"so.com", "www.so.com"} and (path == "" or path.startswith("/s"))
+
+
+def _score_hot_topic_candidate(result: dict[str, Any]) -> int:
+    """Heuristic value score for game-competition-intel hot topics."""
+    title = (result.get("title", "") or result.get("headline", "") or "").strip()
+    snippet = (result.get("snippet", "") or "").strip()
+    combined = f"{title} {snippet}".strip()
+    url = (result.get("url", "") or "").strip()
+
+    if not combined or _is_search_page_url(url):
+        return -999
+    if not _is_game_relevant(combined):
+        return -999
+
+    lowered = combined.lower()
+    recruiting_noise = (
+        "offer", "hiring", "job", "recruit", "campus", "intern",
+        "校招", "社招", "求职", "招聘", "招人", "岗位", "简历", "面试",
+    )
+    if any(p in lowered for p in recruiting_noise):
+        return -999
+    low_value_patterns = (
+        "geo", "seo", "etf", "证券", "基金", "股价", "快讯", "高考", "冲突",
+        "单车", "投影仪", "耳机", "显卡", "手机", "攻略", "开箱", "测评", "优惠",
+    )
+    if any(p in lowered for p in low_value_patterns):
+        return -999
+
+    score = 0
+    high_value_keywords = ("steam", "taptap", "ai", "aigc", "npc", "gdc")
+    for signal in high_value_keywords:
+        if signal in lowered:
+            score += 2
+
+    business_signals = (
+        "版号", "审核", "审批", "上线", "公测", "内测", "测试", "财报", "并购",
+        "收购", "融资", "投资", "合作", "工作室", "裁员", "发行", "代理", "出海",
+        "买量", "流水", "引擎", "平台", "腾讯", "网易", "米哈游", "莉莉丝",
+        "鹰角", "心动", "叠纸", "三七互娱", "世纪华通", "完美世界",
+    )
+    for signal in business_signals:
+        if signal.lower() in lowered:
+            score += 3
+
+    if any(sig in combined for sig in ("塔防", "肉鸽", "Roguelike", "roguelike", "割草")):
+        score += 2
+
+    if score == 0:
+        return -999
+    return score
+
+
+def _filter_results_for_intel(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop generic or low-value hot-topic candidates before AI/fallback."""
+    filtered: list[dict[str, Any]] = []
+    dropped = 0
+
+    for item in results:
+        score = _score_hot_topic_candidate(item)
+        if score < 0:
+            dropped += 1
+            continue
+        kept = dict(item)
+        kept["_intel_score"] = score
+        filtered.append(kept)
+
+    filtered.sort(key=lambda x: -(x.get("_intel_score", 0)))
+    if dropped:
+        print(f"  [FILTER] Dropped {dropped}/{len(results)} low-value hot results",
+              file=sys.stderr)
+    return filtered
+
+
+def _select_rule_based_hot_topics(
+    candidates: list[dict[str, Any]], limit: int = 7
+) -> list[HotTopicItem]:
+    """Conservative fallback when AI returns nothing useful."""
+    ranked = sorted(
+        candidates,
+        key=lambda x: -(x.get("_intel_score", _score_hot_topic_candidate(x))),
+    )
+    selected: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for item in ranked:
+        score = item.get("_intel_score", _score_hot_topic_candidate(item))
+        url = (item.get("url", "") or "").strip().lower()
+        if score < 4 or not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Phase 1.5: Hot Topic Search
 # ═══════════════════════════════════════════════════════════════════
 
 # Engines are tried in order inside _search_with_fallback() — 360 → Sogou → Bing.
 # DDG removed (html.duckduckgo.com returns 202 with no results even with VPN).
+
+# News older than this many days are discarded before AI filtering.
+# Hot topics are by definition current — stale news wastes AI tokens and
+# produces irrelevant briefings.
+_MAX_NEWS_AGE_DAYS = 7
+
+# Fallback regex patterns for date-like strings in titles (safety net).
+# Captures absolute dates with explicit year: "2025-06-29", "2025年6月29日".
+_STALE_DATE_RE = re.compile(
+    r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日]?", re.ASCII
+)
+
+# Month-day-only patterns: "6月29日", "06-29".  Ambiguous — we assume the
+# current year and reject if the computed age exceeds _MONTH_DAY_MAX_AGE
+# (the article is definitely stale regardless of which year it belongs to).
+_MONTH_DAY_RE = re.compile(r"(\d{1,2})[-/月](\d{1,2})[日]?", re.ASCII)
+_MONTH_DAY_MAX_AGE = 90
+
+
+def _parse_news_age_days(time_str: str, ref_date: _date) -> int | None:
+    """Parse a Chinese time string into approximate age in days.
+
+    Handles: "4小时前", "1天前", "3天前", "2025-06-29", "2025年6月29日".
+    Returns None if the string cannot be parsed.
+    """
+    if not time_str:
+        return None
+
+    # "N小时前" → 0 days
+    m = re.match(r"(\d+)\s*小时前", time_str)
+    if m:
+        return 0
+
+    # "N天前" → N days
+    m = re.match(r"(\d+)\s*天前", time_str)
+    if m:
+        return int(m.group(1))
+
+    # "昨天" → 1 day
+    if "昨天" in time_str:
+        return 1
+
+    # "前天" → 2 days
+    if "前天" in time_str:
+        return 2
+
+    # Absolute dates with explicit year: "2025-06-29" or "2025年6月29日"
+    m = _STALE_DATE_RE.search(time_str)
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            pub_date = _date(y, mo, d)
+            return (ref_date - pub_date).days
+        except ValueError:
+            return None
+
+    # Month-day-only: "6月29日" or "06-29".  Assume current year;
+    # reject if > _MONTH_DAY_MAX_AGE (definitely stale regardless of year).
+    m = _MONTH_DAY_RE.search(time_str)
+    if m:
+        try:
+            mo, d = int(m.group(1)), int(m.group(2))
+            pub_date = _date(ref_date.year, mo, d)
+            age = (ref_date - pub_date).days
+            # If the date is in the future assuming current year, it must
+            # be from the previous year — adjust accordingly.
+            if age < 0:
+                pub_date = _date(ref_date.year - 1, mo, d)
+                age = (ref_date - pub_date).days
+            # Only return an age if the article is clearly stale; for
+            # ambiguous recent dates we return None (keep, best-effort).
+            if age > _MONTH_DAY_MAX_AGE:
+                return age
+            return None
+        except ValueError:
+            return None
+
+    return None
+
+
+def _filter_by_age(
+    results: list[dict[str, Any]], ref_date: _date, max_age: int = _MAX_NEWS_AGE_DAYS
+) -> list[dict[str, Any]]:
+    """Filter search results, discarding items older than *max_age* days.
+
+    Parses time strings from the dedicated ``time_str`` field first (set by
+    scrapers), then falls back to parenthesized time markers in title/snippet.
+    The full title/snippet is only scanned for relative-time patterns ("N小时前",
+    "N天前", "昨天", "前天") — **not** absolute dates.  Absolute dates found in
+    body text are often reference dates (e.g. "2025年12月版号数据回顾"),
+    not publication dates, and would cause false-positive filtering.
+
+    Items with no parseable time are kept (best-effort — we'd rather let one
+    unparseable old item through than silently drop fresh news).
+    """
+    kept: list[dict[str, Any]] = []
+    for r in results:
+        # Gather all candidate time strings from the result
+        candidates: list[str] = []
+        title = r.get("title", "") or ""
+        snippet = r.get("snippet", "") or ""
+        time_str = r.get("time_str", "") or ""
+
+        # Priority 0: if the TITLE itself contains an absolute old date,
+        # treat it as stale immediately. This catches reposted/aggregated old
+        # stories that are re-surfaced today with a fresh crawl timestamp.
+        title_abs_age: int | None = None
+        m = _STALE_DATE_RE.search(title)
+        if m:
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                pub_date = _date(y, mo, d)
+                title_abs_age = (ref_date - pub_date).days
+            except ValueError:
+                title_abs_age = None
+        if title_abs_age is None:
+            m = _MONTH_DAY_RE.search(title)
+            if m:
+                try:
+                    mo, d = int(m.group(1)), int(m.group(2))
+                    pub_date = _date(ref_date.year, mo, d)
+                    title_abs_age = (ref_date - pub_date).days
+                    if title_abs_age < 0:
+                        pub_date = _date(ref_date.year - 1, mo, d)
+                        title_abs_age = (ref_date - pub_date).days
+                except ValueError:
+                    title_abs_age = None
+        if title_abs_age is not None and title_abs_age > max_age:
+            print(f"  [STALE] Dropped by title date ({title_abs_age}d old): {title[:80]}",
+                  file=sys.stderr)
+            continue
+
+        # Priority 1: dedicated time_str field from scraper
+        if time_str:
+            candidates.append(time_str)
+
+        # Priority 2: parenthesized time markers in title/snippet
+        # (e.g., 360 news appends "(4小时前)" to the title)
+        for source in (title, snippet):
+            for m in re.finditer(r"\(([^)]+)\)", source):
+                candidates.append(m.group(1))
+
+        # Priority 3: scan full text for relative-time indicators only.
+        # Absolute dates (YYYY-MM-DD, "2025年12月…") found in body text
+        # are often reference dates, NOT publication dates — do NOT scan
+        # for those here.
+        _RELATIVE_TIME_RE = re.compile(
+            r"(\d+)\s*(?:小时前|天前)|昨天|前天"
+        )
+        for source in (title, snippet):
+            if _RELATIVE_TIME_RE.search(source):
+                candidates.append(source)
+
+        age: int | None = None
+        for c in candidates:
+            age = _parse_news_age_days(c, ref_date)
+            if age is not None:
+                break
+
+        if age is not None and age > max_age:
+            print(f"  [STALE] Dropped ({age}d old): {title[:80]}", file=sys.stderr)
+            continue
+
+        kept.append(r)
+
+    if len(kept) < len(results):
+        print(f"  [STALE] Filtered out {len(results) - len(kept)}/{len(results)}"
+              f" results older than {max_age} days", file=sys.stderr)
+
+    return kept
 
 
 def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
@@ -450,6 +780,12 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
             "warnings": ["No hot keywords found for this date"],
         }
 
+    # Parse reference date once for stale-news filtering
+    try:
+        ref_date = _date.fromisoformat(date)
+    except ValueError:
+        ref_date = _date.today()
+
     warnings: list[str] = []
 
     # ── Search per keyword ──
@@ -458,31 +794,45 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
 
     for kw in keywords:
         keyword = kw["keyword"]
-        query = f"{keyword} 游戏行业"
-        query_hash = hashlib.md5(f"{query}|{date}".encode()).hexdigest()
+        queries = _build_hot_search_queries(keyword, date)
 
-        # Check cache first (unless force). Skip empty cached results —
-        # a transient failure that returned [] should not block re-search for 24h.
-        if not force:
-            try:
-                cached = db.get_cached_search(query_hash, max_age_hours=24)
-                if cached is not None and len(cached) > 0:
-                    for r in cached:
-                        r["keyword"] = keyword
-                    all_results.extend(cached)
-                    keywords_searched += 1
-                    continue
-            except Exception as e:
-                print(f"  [WARN] search cache read failed for '{keyword}': {e}", file=sys.stderr)
+        for query in queries:
+            query_hash = hashlib.md5(f"{query}|{date}".encode()).hexdigest()
 
-        results = _search_with_fallback(query, max_results=5)
-        keywords_searched += 1
-        if results:
+            # Check cache first (unless force). Skip empty cached results —
+            # a transient failure that returned [] should not block re-search for 24h.
+            if not force:
+                try:
+                    cached = db.get_cached_search(query_hash, max_age_hours=24)
+                    if cached is not None and len(cached) > 0:
+                        # Still filter cached results. If all cached items are now
+                        # stale, fall through to fresh search instead of producing 0.
+                        cached = _filter_by_age(cached, ref_date)
+                        cached = _filter_results_for_intel(cached)
+                        if cached:
+                            for r in cached:
+                                r["keyword"] = keyword
+                            all_results.extend(cached)
+                            keywords_searched += 1
+                            break
+                except Exception as e:
+                    print(f"  [WARN] search cache read failed for '{keyword}': {e}", file=sys.stderr)
+
+            results = _search_with_fallback(query, max_results=5)
+            keywords_searched += 1
+            if not results:
+                continue
+
+            # Filter stale news before AI sees them (Layer 2: scraper-level gate)
+            results = _filter_by_age(results, ref_date)
+            results = _filter_results_for_intel(results)
+            if not results:
+                continue
             for r in results:
                 r["keyword"] = keyword
             all_results.extend(results)
 
-            # Cache the results
+            # Cache the filtered results
             try:
                 db.cache_search(
                     query_hash=query_hash,
@@ -494,6 +844,7 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
                 )
             except Exception as e:
                 print(f"  [WARN] search cache write failed for '{query}': {e}", file=sys.stderr)
+            break
 
     # ── Dedup by URL ──
     seen_urls: set[str] = set()
@@ -505,6 +856,16 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
             unique_results.append(r)
 
     # ── Write to DB ──
+    if not unique_results:
+        local_candidates = _build_search_fallback_candidates(date)
+        if local_candidates:
+            unique_results = local_candidates
+            all_results = list(local_candidates)
+            print(
+                f"  [FALLBACK] Using {len(local_candidates)} local market-news candidates",
+                file=sys.stderr,
+            )
+
     if unique_results:
         try:
             from src.tools.url_utils import extract_domain
@@ -536,21 +897,19 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
                         db.mark_hot_topic_selected(urls, date)
                     # Persist AI summaries back to DB for render to use
                     _persist_ai_summaries(ai_selected, date, db)
+                else:
+                    fallback_items = _select_rule_based_hot_topics(records, limit=7)
+                    fallback_deduped = _dedup_against_market_news(
+                        fallback_items, date, unique_results[:30]
+                    )
+                    urls = [r["url"] for r in fallback_deduped if r.get("url")]
+                    if urls:
+                        db.mark_hot_topic_selected(urls, date)
             except Exception as e:
                 print(f"  [WARN] Hot Tracker Agent failed, using fallback: {e}",
                       file=sys.stderr)
-                # Fallback: simple first 7 by search order, deduped against market
-                fallback_items = [
-                    {
-                        "headline": r.get("headline", ""),
-                        "url": r.get("url", ""),
-                        "source": r.get("source", ""),
-                        "snippet": r.get("snippet", ""),
-                        "search_engine": r.get("search_engine", ""),
-                        "keyword": r.get("keyword", ""),
-                    }
-                    for r in records[:7]
-                ]
+                # Conservative fallback: only keep rule-passing intel-like items
+                fallback_items = _select_rule_based_hot_topics(records, limit=7)
                 fallback_deduped = _dedup_against_market_news(
                     fallback_items, date, unique_results[:30]
                 )
@@ -565,6 +924,79 @@ def search_hot_topics(date: str, force: bool = False) -> dict[str, Any]:
         "keywords_searched": keywords_searched,
         "warnings": warnings,
     }
+
+
+def _build_hot_search_queries(keyword: str, date: str) -> list[str]:
+    """Build query variants that bias toward fresh game-business intel."""
+    return [
+        f"{keyword} 今天",
+        f"{keyword} 最新",
+        f"{keyword} 游戏 今日",
+        f"{keyword} 游戏 行业 今天",
+        f"{keyword} 游戏 行业 {date}",
+    ]
+
+
+def _build_local_hot_candidates(date: str) -> list[dict[str, Any]]:
+    """Pull today's own game-news rows as a fallback hot-topic pool."""
+    db = get_db()
+    try:
+        market_news = db.get_market_news_by_date(date)
+    except Exception as e:
+        print(f"  [WARN] Failed to load market news fallback: {e}", file=sys.stderr)
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for row in market_news:
+        title = (row.get("headline", "") or row.get("title", "") or "").strip()
+        url = (row.get("url", "") or "").strip()
+        if not title or not url:
+            continue
+        if not _is_game_relevant(title):
+            continue
+        if _score_hot_topic_candidate({"title": title, "snippet": row.get("snippet", ""), "url": url}) < 0:
+            continue
+        candidates.append({
+            "title": title,
+            "url": url,
+            "snippet": row.get("snippet", "") or "",
+            "keyword": row.get("source", "") or "market_news",
+            "search_engine": "local-fallback",
+        })
+
+    candidates.sort(key=lambda item: _score_hot_topic_candidate(item), reverse=True)
+    return candidates[:20]
+
+
+def _build_search_fallback_candidates(date: str) -> list[dict[str, Any]]:
+    """Pull today's market_news rows and keep only the most hot-topic-like ones."""
+    db = get_db()
+    try:
+        market_news = db.get_market_news_by_date(date)
+    except Exception as e:
+        print(f"  [WARN] Failed to load market news fallback: {e}", file=sys.stderr)
+        return []
+
+    fallback: list[dict[str, Any]] = []
+    for row in market_news:
+        title = (row.get("headline", "") or row.get("title", "") or "").strip()
+        url = (row.get("url", "") or "").strip()
+        if not title or not url:
+            continue
+        score = _score_hot_topic_candidate({"title": title, "snippet": row.get("snippet", ""), "url": url})
+        if score < 0:
+            continue
+        fallback.append({
+            "title": title,
+            "url": url,
+            "snippet": row.get("snippet", "") or "",
+            "keyword": row.get("source", "") or "market_news",
+            "search_engine": "market-news-fallback",
+            "_intel_score": score,
+        })
+
+    fallback.sort(key=lambda item: -(item.get("_intel_score", 0)))
+    return fallback[:7]
 
 
 def _dedup_against_market_news(
@@ -685,29 +1117,37 @@ def _dedup_against_market_news(
 
 
 def _search_with_fallback(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """Search with 360-news-first fallback chain. Returns results with search_engine tag.
+    """Search with Bocha-first fallback chain. Returns results with search_engine tag."""
+    from src.tools.web_search import _search_bocha
 
-    DDG removed from chain (html.duckduckgo.com returns 202 with no results even
-    with VPN — confirmed 2026-06-26). 360/Sogou handle Chinese game queries well.
-    """
     engines: list[tuple[str, Any]] = [
+        ("bocha-news", lambda q, n: _search_bocha(q, n, news=True)),
+        ("bocha-web", lambda q, n: _search_bocha(q, n, news=False)),
         ("360-news", _scrape_360_news),
         ("sogou-news", _scrape_sogou_news),
     ]
 
+    attempts = 0
     for engine_name, engine_fn in engines:
         try:
             result_str = engine_fn(query, max_results)
             result = json.loads(result_str)
             results = result.get("results", [])
+            attempts += 1
+            print(
+                f"  [SEARCH] engine={engine_name} query={query!r} returned={len(results)}",
+                file=sys.stderr,
+            )
             if results:
                 for r in results:
                     r["search_engine"] = engine_name
                 return results
         except Exception as e:
+            attempts += 1
             print(f"  [WARN] search engine '{engine_name}' failed: {e}", file=sys.stderr)
             continue
 
+    print(f"  [SEARCH] query={query!r} exhausted {attempts} engines", file=sys.stderr)
     return []
 
 
@@ -844,6 +1284,32 @@ def _ai_filter_hot_topics(
             else getattr(item, "value_score", 0)
         )
         enriched.append(candidate)
+
+    # ── Layer 4: safety-net scan for absolute dates in titles ──
+    # Belt-and-suspenders — if a stale item slipped past the scraper-level
+    # filter (Layer 2), drop it here before it reaches the briefing card.
+    try:
+        ref_date = _date.fromisoformat(date)
+    except ValueError:
+        ref_date = _date.today()
+
+    stale_ids: set[int] = set()
+    for i, item in enumerate(enriched):
+        title = item.get("title", "") or item.get("headline", "")
+        m = _STALE_DATE_RE.search(title)
+        if m:
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                pub_date = _date(y, mo, d)
+                age = (ref_date - pub_date).days
+                if age > _MAX_NEWS_AGE_DAYS:
+                    print(f"  [STALE] Safety-net dropped AI-selected item"
+                          f" ({age}d old): {title[:80]}", file=sys.stderr)
+                    stale_ids.add(i)
+            except ValueError:
+                pass
+    if stale_ids:
+        enriched = [item for i, item in enumerate(enriched) if i not in stale_ids]
 
     # Sort by value_score descending, return top 7
     enriched.sort(key=lambda x: x.get("value_score", 0), reverse=True)

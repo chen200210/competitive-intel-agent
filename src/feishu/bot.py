@@ -180,9 +180,113 @@ def _handle_hot_topic_click(
                 f"已记录你对{keyword_display}相关热点的兴趣，我们会持续优化推荐 🙏",
                 chat_id,
             )
+
+        # ── Auto-trigger Deep Research if click threshold reached ──
+        DEEP_RESEARCH_CLICK_THRESHOLD = 3
+        try:
+            click_count = db.get_topic_click_count(keyword=keyword, since_date=target_date)
+            if click_count >= DEEP_RESEARCH_CLICK_THRESHOLD:
+                # The DB stores the enriched question as topic, not the raw keyword
+                enriched_question = _enrich_research_question(keyword)
+                already_ran = db.get_deep_research_report(target_date, enriched_question)
+                if not already_ran:
+                    import threading
+                    t = threading.Thread(
+                        target=_run_deep_research_and_push,
+                        args=(keyword, target_date, chat_id),
+                        daemon=True,
+                    )
+                    t.start()
+                    _reply_text(
+                        f"「{keyword}」相关深度研究报告正在生成中，完成后将推送到本群 ⏳",
+                        chat_id,
+                    )
+        except Exception as e:
+            print(f"  [WARN] Deep Research auto-trigger check failed: {e}", file=sys.stderr)
     except Exception as e:
         logger.error(f"Failed to record hot topic click: {e}")
         _reply_text("感谢反馈！🙏", chat_id)
+
+
+def _run_deep_research_and_push(keyword: str, date: str, chat_id: str) -> None:
+    """Background thread: run Deep Research and push results to chat.
+
+    Parameters are intentionally simple to avoid coupling with complex objects
+    across the thread boundary. Called by _handle_hot_topic_click when auto-trigger
+    threshold is reached.
+    """
+    try:
+        from src.agents.deep_researcher import run_deep_research
+
+        # ── Short keyword enrichment ──
+        # Hot topic keywords are often 2-4 characters (e.g. "版号", "米哈游").
+        # The Deep Research Agent expects a full research question, so expand
+        # bare keywords into a well-formed question before passing it in.
+        question = _enrich_research_question(keyword)
+
+        print(f"\n[DR-AUTO] Auto-triggered Deep Research: keyword='{keyword}' → question='{question}' (date={date})",
+              file=sys.stderr)
+
+        result = run_deep_research(
+            question=question,
+            date=date,
+            push_chat_id=chat_id,
+            verbose=True,
+            triggered_by="auto",
+            source_hot_topic_url=keyword,  # original keyword traces back to hot_topic_news
+            original_keyword=keyword,      # for matching user click records in DB
+        )
+
+        if result.get("success"):
+            print(f"  [DR-AUTO] Research complete for '{keyword}', pushed to {chat_id}",
+                  file=sys.stderr)
+        else:
+            print(f"  [DR-AUTO] Research failed for '{keyword}': {result.get('error', 'unknown')}",
+                  file=sys.stderr)
+            # Notify the chat that research failed
+            _reply_text(
+                f"「{keyword}」深度研究报告生成失败，请稍后重试或联系管理员 🙇",
+                chat_id,
+            )
+    except Exception as e:
+        print(f"  [DR-AUTO] Fatal error in deep research thread: {e}", file=sys.stderr)
+        try:
+            _reply_text(
+                f"「{keyword}」深度研究报告生成遇到错误，请稍后重试 🙇",
+                chat_id,
+            )
+        except Exception:
+            pass
+
+
+def _enrich_research_question(keyword: str) -> str:
+    """Expand a short hot-topic keyword into a full research question.
+
+    Hot Tracker keywords are typically 2-4 characters (e.g. "版号", "米哈游",
+    "肉鸽"). The Deep Research Agent performs best with a well-scoped question
+    rather than a bare keyword — this function bridges the gap.
+
+    Heuristic:
+      - ≤4 chars: wrap as "游戏行业\"{keyword}\" {current_year}年最新动态与发展趋势"
+      - ≤8 chars or single word: wrap as "游戏行业 \"{keyword}\" — 最新动态与行业影响"
+      - already a question or longer phrase: use as-is
+    """
+    from datetime import date as _d
+
+    kw = keyword.strip()
+    if not kw:
+        return kw
+
+    # Already a well-formed question
+    if "？" in kw or "?" in kw or len(kw) > 12:
+        return kw
+
+    # Build a context-rich question
+    year = _d.today().year
+    if len(kw) <= 4:
+        return f'游戏行业 "{kw}" {year}年最新动态与发展趋势'
+    else:
+        return f'游戏行业 "{kw}" — 最新动态与行业影响'
 
 
 # ── User name cache ──────────────────────────────────────────────

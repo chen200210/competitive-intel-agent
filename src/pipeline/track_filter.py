@@ -27,6 +27,7 @@ import sys
 from typing import Any
 
 from src.types import NewGameEntry, ChangeRecord
+from src.pipeline.token_utils import ascii_word_match
 
 
 # ── Default keyword lists (fallback if YAML unavailable) ─────
@@ -119,10 +120,13 @@ def is_steam_port_always_include() -> bool:
 # ── Core classification logic ────────────────────────────────
 
 def _keyword_in_text(keywords: list[str], text: str) -> bool:
-    """Case-insensitive keyword match in text. Checks substrings."""
-    text_lower = text.lower()
+    """Case-insensitive keyword match in text.
+
+    Delegates to token_utils.ascii_word_match() for consistent
+    word-boundary handling across the codebase.
+    """
     for kw in keywords:
-        if kw.lower() in text_lower:
+        if ascii_word_match(kw, text):
             return True
     return False
 

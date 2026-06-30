@@ -18,11 +18,12 @@ Usage:
 from __future__ import annotations
 
 import json
-import re
 import sys
 from typing import Any
 
 from pydantic import BaseModel, model_validator
+
+from src.pipeline.token_utils import ascii_word_match
 
 
 # ═════════════════════════════════════════════════════════════
@@ -435,25 +436,14 @@ _DIM_MAX = 70              # Ceiling for any single dimension
 def _match_topic(headline: str, topic: str) -> bool:
     """Check whether *headline* contains any keyword for *topic*.
 
-    Short Latin tokens (≤3 chars, all ASCII) require word boundaries to
-    avoid substring false-positives: ``"IP"`` matching ``"chip"``,
-    ``"AI"`` matching ``"train"``.
+    Delegates to token_utils.ascii_word_match() for consistent
+    word-boundary handling across the codebase.
     """
     keywords = TOPIC_KEYWORD_MAP.get(topic, [])
     if not keywords:
         return False
-    hl_lower = headline.lower()
     for kw in keywords:
-        kw_lower = kw.lower()
-        if kw_lower in hl_lower:
-            # Short Latin tokens need word-boundary check.
-            # MUST use re.ASCII: in Python's default Unicode mode,
-            # CJK characters are \w, so \bAI\b would NOT match
-            # "AI游戏引擎" (no boundary between I and 游).
-            if len(kw) <= 3 and kw.isascii() and kw.isalpha():
-                if not re.search(rf"\b{re.escape(kw_lower)}\b", hl_lower,
-                                 flags=re.ASCII):
-                    continue
+        if ascii_word_match(kw, headline):
             return True
     return False
 
@@ -544,7 +534,8 @@ def _analyze_feedback_rules(
     insight_down = sum(f["down"] for f in insight_rows)
     insight_net = insight_up - insight_down
 
-    # Row counts for finding evidence (used in Phase C)
+    # Evidence counts per dimension — number of feedback rows that support each signal.
+    # Distinct from abs(delta) which measures weight-adjustment magnitude (capped at ±5).
     dim_row_counts: dict[str, int] = {
         "track": len(track_rows),
         "density": len(density_rows),

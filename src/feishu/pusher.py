@@ -127,6 +127,45 @@ def push_text(
     return send_message(content, msg_type="text", chat_id=chat_id)
 
 
+def push_deep_research_with_mentions(
+    card: dict[str, Any],
+    chat_id: str,
+    mention_open_ids: list[str],
+    mention_text: str = "深度研究报告已生成",
+) -> dict[str, Any]:
+    """Push a deep research card preceded by a text message with @mentions.
+
+    Feishu interactive cards don't support <at> tags — we send a separate
+    text message with @mentions first, then the card. This is the standard
+    workaround for notifying specific users about card content.
+
+    Args:
+        card: The card dict to push.
+        chat_id: Feishu chat_id (e.g., "oc_xxx").
+        mention_open_ids: List of user open_ids to @mention (max 10).
+        mention_text: Text to show after the @mentions.
+
+    Returns:
+        dict with success/error from the card push (text message errors are logged but non-blocking).
+    """
+    # Step 1: Text message with @mentions
+    if mention_open_ids:
+        at_parts = " ".join(
+            f'<at user_id="{oid}"></at>' for oid in mention_open_ids[:10]
+        )
+        text_content = json.dumps({
+            "text": f"{at_parts} {mention_text}"
+        }, ensure_ascii=False)
+        text_result = send_message(text_content, msg_type="text", chat_id=chat_id)
+        if not text_result.get("success"):
+            logger.warning(
+                f"@mention text message failed: {text_result.get('error', 'unknown')}"
+            )
+
+    # Step 2: Card
+    return push_card(card, chat_id)
+
+
 # ── Utility ─────────────────────────────────────────────────────
 
 def get_chat_list() -> list[dict[str, Any]]:
@@ -330,7 +369,6 @@ def upload_images_for_card(
     if not image_urls:
         return card
 
-    import sys
     uploaded_keys: list[str] = []
     for url in image_urls[:3]:  # max 3 images per card
         result = upload_image(url)
@@ -365,7 +403,6 @@ def upload_images_for_card(
 # ── CLI ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 

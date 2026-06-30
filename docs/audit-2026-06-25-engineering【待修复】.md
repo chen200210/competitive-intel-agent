@@ -8,99 +8,82 @@
 
 ## 🔴 确认 Bug（需修复）
 
-### BUG #E1: `except Exception: pass` 系统性静默吞异常（CRITICAL）
+### BUG #E1: `except Exception: pass` 系统性静默吞异常（CRITICAL） ✅ **已修复 2026-06-26**
 
-**范围**: 全项目 ~35% 的 `except` 块为空 `pass` | **严重度**: CRITICAL
+**范围**: 全项目 ~55 处 `except Exception:` 裸块 | **严重度**: CRITICAL | **状态**: 已修复
 
-以下关键路径的异常被静默吞掉，故障完全不可观测：
-
-| 文件:行号 | 场景 | 后果 |
-|-----------|------|------|
-| `runner.py:224` | `insert_pipeline_run()` 写入失败 | 整条运行记录丢失，监控系统看不到任何异常 |
-| `runner.py:175` | 获取 B 站视频列表失败 | audit 拿不到完整 context，卡片质量检查不完整 |
-| `briefer.py:134` | 标签持久化失败 | pos_label/neg_label 未写入 DB，Calibrator 无信号可分析 |
-| `taptap_resolver.py:49` | 数据库缓存查询失败 | 每次都重新走 Playwright 浏览器解析，无缓存加速 |
-| `taptap_resolver.py:106` | Playwright 页面操作失败 | 调用方拿到空结果但不知道是"没找到"还是"出错了" |
-| `dedup.py` 5 处 | 去重记录写入/查询失败 | 重复内容可能被推送多次，用户看到重复日报 |
-| `scorer.py:57` | `load_scoring_config()` YAML 加载失败 | 默默用硬编码默认值，配置变更不生效且无告警 |
-| `hot_tracker.py` 4 处 | 热点关键词收集/搜索失败 | 日报缺热点板块，用户看不到但系统不自知 |
-
-**修复方向**:
-1. 区分三类异常处理策略：`fatal`（抛出任其传播）、`degraded`（`logging.warning` + 继续）、`best-effort`（仅限注释明确说明的场景）
-2. 关键路径（`insert_pipeline_run`、标签持久化、去重写入）禁止静默——至少 `logging.error`
-3. `best-effort` 场景必须在注释中说明"为什么失败不影响核心输出"
+**修复内容**:
+- 全项目 22 个 Python 文件共 ~63 处 `except Exception:` 改为 `except Exception as e:` + `print(f"  [WARN] ...: {e}", file=sys.stderr)`
+- 覆盖关键路径：DB 写入（sqlite.py）、标签持久化（briefer.py:134）、去重读写（dedup.py 8 处）、AI 打分兜底（scorer.py）、管道监控记录（runner.py:224）
+- 所有 scraper 文件（bilibili_creators、diandian_batch、news_feeds、steam_ports、taptap_new_games）同步修复
+- 当前全项目 `src/` + `tools/` 目录 0 处裸 `except Exception:`，124 处带日志的 `except Exception as e:`
 
 ---
 
-### BUG #E2: `taptap_resolver.py` Playwright 资源泄漏风险（HIGH）
+### BUG #E2: `taptap_resolver.py` Playwright 资源泄漏风险（HIGH） ✅ **已修复 2026-06-26**
 
-**文件**: `src/tools/taptap_resolver.py` | **严重度**: HIGH
+**文件**: `src/tools/taptap_resolver.py` | **严重度**: HIGH | **状态**: ✅ 已修复
 
-`sync_playwright()` 上下文管理器未包裹在 `try/finally` 中。如果 `page.goto()` 或 `page.content()` 抛异常，浏览器进程不会被清理，每次泄漏一个 Chromium 实例。
+**修复内容**:
+- `context.close()` 移入 `try/finally` 块，确保 `page.goto()` 或 click 操作抛异常时浏览器 context 仍然被关闭
+- `sync_playwright()` 上下文管理器作为第二层安全网（driver 进程级别清理），但 `finally` 确保 context 级别优雅关闭
+- 详见 `CLAUDE.md` #13
 
 ```python
-# 当前代码（简化）
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    page = browser.new_page()
-    page.goto(url)          # 如果这里抛异常...
-    html = page.content()   # 或者这里...
-    # browser.close() 永远不会被调用
+# 修复后
+context = p.chromium.launch_persistent_context(...)
+try:
+    page = context.new_page()
+    page.goto(...)
+    # ... click/extract logic ...
+finally:
+    context.close()  # 异常安全
 ```
-
-**修复方向**: 内层加 `try/finally` 确保 `browser.close()` 必定执行，或使用 Playwright 的 `browser = await p.chromium.launch()` 后 `async with browser:` 模式。
 
 ---
 
-### BUG #E3: `_keyword_in_text()` 无单词边界检查导致误分类（MEDIUM）
+### BUG #E3: `_keyword_in_text()` 无单词边界检查导致误分类（MEDIUM） ✅ **已修复 2026-06-26**
 
-**文件**: `src/pipeline/track_filter.py` | **严重度**: MEDIUM
+**文件**: `src/pipeline/track_filter.py` | **严重度**: MEDIUM | **状态**: ✅ 已修复
 
-`_keyword_in_text()` 做的是纯子串匹配。游戏名或描述中包含 "TD" 作为子串（如 "WTD"、"TDK"、"STD"）会被误分类为塔防赛道。
+**原始问题**: `_keyword_in_text()` 纯子串匹配导致 "TD" 误匹配 "WTD"、"GTD" 等。
 
-```python
-# 当前逻辑
-if "TD" in text.upper():  # 匹配 "WTD Studios" 中的 TD
-    return True
-```
-
-**修复方向**: 对缩写类关键词（TD、TDs）加单词边界检查（`\bTD\b`），或至少检查前后字符是否为空格/标点/字符串边界。
+**修复内容**:
+- 纯 ASCII 关键词（`kw.isascii() and kw.isalpha()`）使用 `\b` 单词边界 + `re.ASCII` flag
+- **关键细节**: 必须使用 `re.ASCII`——Python 默认 Unicode 模式将 CJK 字符视为 `\w`，导致 `\bTD\b` 无法匹配 "塔防TD手游"（防(\w)→T(\w) 无边界）。`calibrator.py:_match_topic()` 已正确处理此问题（`flags=re.ASCII` + 注释说明）
+- 混合关键词（如 "幸存者like"）回退到子串匹配，避免 `\b` 在 CJK/ASCII 边界失效
+- 详见 `CLAUDE.md` #13
 
 ---
 
-### BUG #E4: `_shown_games_cache` 模块级全局可变状态 — 竞态条件（MEDIUM）
+### BUG #E4: `_shown_games_cache` 模块级全局可变状态 — 竞态条件（MEDIUM） ✅ 已修复 (2026-06-26)
 
-**文件**: `src/agents/briefer.py` | **严重度**: MEDIUM
+**文件**: `src/agents/briefer.py` | **严重度**: MEDIUM | **状态**: ✅ 已修复
 
-```python
-_shown_games_cache: dict[str, set[str]] = {}
-```
-
-模块级可变字典在多线程环境下（runner 使用 `ThreadPoolExecutor`）存在竞态条件。虽然当前 `brief_from_db` 在单线程中调用，但一旦未来并行化 briefer 调用，缓存会被并发读写破坏。
-
-**修复方向**: 将缓存移到 `Database` 类中，或用 `threading.local()` 做线程隔离，或直接用 `lru_cache` 装饰器替代手动缓存。
+`_shown_games_cache` 模块级可变字典已在 briefer 拆分重构中移除，缓存逻辑整合到 `Database` 调用中，不再使用模块级全局状态。
 
 ---
 
-### BUG #E5: 延迟导入打破循环依赖 — 架构坏味道（MEDIUM）
+### BUG #E5: 延迟导入打破循环依赖 — 架构坏味道（MEDIUM） ✅ **已修复 2026-06-26**
 
-**文件**: `src/agents/briefer.py` + `src/agents/render.py` | **严重度**: MEDIUM
+**文件**: 全项目 `src/` | **严重度**: MEDIUM | **状态**: ✅ 已修复
 
-```python
-# briefer.py 中
-def brief_from_db(...):
-    from src.agents.render import build_market_elements  # 延迟导入
+**原始问题**: 全项目 ~114 处函数内 `from src.xxx import yyy`，审计文档原以为是"打破循环依赖"。实际分析发现 briefer 拆分后**已无跨模块循环依赖**——这些延迟导入是拆分时从原 1263 行单文件带过来的惯性写法，不是必要技术手段。
 
-# render.py 中
-def _match_new_game(...):
-    from src.agents.scorer import ...  # 延迟导入
-```
+**修复内容**:
+- `briefer.py` — 10 处 render/market_pipeline/scorer/dedup/differ/track_filter/taptap_resolver 提至顶层
+- `render.py` — 4 处 enrichment/card_builder/pusher/url_utils 提至顶层
+- `scorer.py` — 2 处 token_utils/source_constants 提至顶层
+- `market_pipeline.py` — 2 处 dedup/enrichment 提至顶层
+- `dedup.py` — 1 处 token_utils 提至顶层
+- `enrichment.py` — 1 处 image_fetch 提至顶层
+- `hot_tracker.py` — 2 处 web_search/base 提至顶层
+- **合计 ~22 处延迟导入提至模块顶层**
 
-函数内部的 `import` 是为了打破模块间的循环依赖。这表明模块边界划分有问题——`render` 不应该依赖 `scorer`，`briefer` 和 `render` 之间应该有更清晰的单向依赖。
-
-**修复方向**:
-- `_match_new_game` 依赖的 `fuzzy_match_game_name` 已经提取到 `src/tools/taptap_resolver.py`，检查是否还有残留依赖
-- 考虑引入 `src/agents/shared.py` 存放共享常量和轻量工具函数，打破循环
+**保留内联的场景**（仅 3 种合法理由）:
+1. `get_db()` / `settings` — 惰性加载避免 import 时触发 DB 连接/.env 读取
+2. `try/except ImportError` / `try/except Exception` — 优雅降级（calibrator、classify_game、taptap_resolver 等）
+3. `if __name__ == "__main__"` 块 — CLI 入口专用导入
 
 ---
 
@@ -172,19 +155,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 | 严重度 | 数量 | Bug 编号 |
 |--------|------|----------|
-| CRITICAL | 1 | E1 |
-| HIGH | 1 | E2 |
-| MEDIUM | 3 | E3, E4, E5 |
+| CRITICAL | 0 (E1 已修复) | — |
+| HIGH | 0 (E2 已修复) | — |
+| MEDIUM | 0 (E3, E5 已修复) | — |
 | LOW | 4 | E6, E7, E8, E9 |
-| **合计** | **9** | |
+| **待修复** | **4** | |
+| **已修复** | **5** | E1, E2, E3, E4, E5 (all 2026-06-26) |
 
 ---
 
 ## 与非 Bug 改进的界限
 
 以下从评审中识别的问题**不属于 Bug**，不在本审计文档修复范围：
-- **`sqlite.py` 上帝类拆分** → 架构重构，需单独规划
-- **`dict[str, Any]` → TypedDict 迁移** → 渐进式类型改进，非缺陷
+
+- **`sqlite.py` 上帝类拆分** → 架构重构，需单独规划。**→ [决策记录：暂不拆分](#决策记录-sqlitepy-上帝类暂不拆分)**
+- **`dict[str, Any]` → TypedDict 迁移** → ✅ Layer 1 已完成 (2026-06-26): `src/types.py` 11 个 TypedDict + 10 个文件函数签名更新。Layer 2（dataclass DTO）择机推进。
 - **pytest 迁移 + CI 搭建** → 基础设施改进，非代码缺陷
 - **Git 历史整理** → 流程改进，非代码缺陷
 - **集成测试补全** → 测试覆盖率改进，非缺陷
+
+---
+
+## 决策记录: `sqlite.py` 上帝类暂不拆分
+
+> **决策日期**: 2026-06-26
+> **决策**: 降级为 P3（nice-to-have），不纳入当前迭代
+> **触发条件**: 文件膨胀到 2000+ 行、或需要单独测试某个 repo、或新增数据表超过 20 张
+
+### 评估
+
+| 维度 | 分析 |
+|------|------|
+| **当前规模** | 1343 行，对于 DAO 层不算大。拆成 6 个 repo 后每个 ~220 行，净减代码量有限 |
+| **代码性质** | 方法基本都是 5-15 行的 thin wrapper，彼此不交叉调用，不存在"类太大导致的理解困难" |
+| **炸半径** | 50+ 调用点全得改 import。当前 `get_db().some_method()` 模式足够清晰，从未因此产生过 bug |
+| **对比 Briefer 拆分** | Briefer 拆分有实效——消除了循环依赖、分离了 AI 层和规则层。DAO 层不存在这类问题，所有方法都是独立数据访问 |
+| **机会成本** | 有更值得做的事：热点追踪增强 → 全自动 cron → Docker 化。拆分 DAO 不阻塞任何功能，也不解决现存的正确性或性能问题 |
+
+### 将来方案（如果触发条件满足）
+
+采用 **Facade 模式**，零破坏迁移：
+
+```python
+class Database:
+    def __init__(self):
+        self._conn = ...
+        self.rankings = _RankingRepo(self._conn)   # 具体 CRUD 搬进去
+        self.news = _NewsRepo(self._conn)          # 共享连接
+        self.feedback = _FeedbackRepo(self._conn)
+
+# 调用方渐进迁移：db.insert_rankings() → db.rankings.insert()
+# 整个过程旧接口保留，不强制一次性迁移
+```
