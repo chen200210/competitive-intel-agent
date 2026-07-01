@@ -1,0 +1,14 @@
+[Unit]
+Description=OA Feishu Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/oa
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/oa/.venv/bin/python -m src.feishu.bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

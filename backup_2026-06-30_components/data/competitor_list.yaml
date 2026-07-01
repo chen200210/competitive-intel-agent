@@ -1,0 +1,83 @@
+# ============================================
+# 竞品列表配置 + 业务方向定义
+# ============================================
+
+# === 公司业务方向定义 ===
+hot_tracker:
+  enabled: false
+  required: false
+
+business_focus:
+  genres:
+    - "塔防"
+    - "移动塔防"
+    - "传统TD塔防"
+    - "移动城堡like"
+    - "肉鸽"
+    - "Roguelike"
+    - "Roguelite"
+    - "割草"
+    - "幸存者like"
+    - "Vampire Survivors"
+  themes: []
+  validated_mechanisms:
+    - "已被市场验证的塔防玩法"
+    - "已验证的商业化模型"
+
+# === 重点关注竞品（在榜单上监控的已上线游戏） ===
+# 按 DESIGN.md 7.3 节定义，从榜单中筛选与业务方向相关的游戏
+monitored_games: []
+
+# === 在研公司追踪（不在榜单上，但需要主动搜索） ===
+# 按 DESIGN.md 7.3 节定义
+in_development_tracking: []
+
+# === 赛道筛选配置 ===
+# 规则：
+#   1. track 关键词命中 → 必然关注（赛道覆盖规则优先于可无视类别）
+#   2. ignored 类别命中且未命中 track → 排除
+#   3. 既未命中 track 也未命中 ignored → neutral（正常关注）
+#   例: 明日方舟(tag:塔防+二次元) → 塔防命中 → 关注（赛道规则优先）
+track_config:
+  genres:
+    - "塔防"
+    - "TD"
+    - "Tower Defense"
+    - "肉鸽"
+    - "Roguelike"
+    - "Roguelite"
+    - "割草"
+    - "幸存者like"
+    - "Vampire Survivors"
+  ignored_categories:
+    - "女性向"
+    - "二次元"
+    - "乙女"
+  track_overrides_ignore: true
+  steam_port_always_include: true
+  note: |
+    赛道关键词命中 → 无论是否命中可无视类别，一律关注。
+    可无视类别仅在不命中赛道时生效。
+    Steam移植手游不论赛道是否沾边都应调查其玩法和tag。
+  # ── 新闻打分参数（Calibrator Agent 上线后将动态写入此节点）──
+  scoring:
+    min_ai_score: 40       # AI 打分阈值，低于此分不入选
+    top_n: 7               # 最终精选条数
+    max_bilibili: 2        # 最多入选 B站 条数
+    max_per_source: 3      # 单一来源最多入选条数
+
+# === 显著性判定阈值 ===
+significance_thresholds:
+  rank_change_min: 3
+  always_trigger:
+    - "new_entry"
+    - "dropped_out"
+    - "rank <= 5"
+  # TD 品类加成：同品类变动自动加分
+  genre_boost:
+    - genre: "塔防"
+      boost: 2.0
+    - genre: "肉鸽"
+      boost: 2.0
+    - genre: "割草"
+      boost: 2.0

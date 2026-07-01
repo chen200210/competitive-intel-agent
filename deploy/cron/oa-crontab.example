@@ -1,0 +1,10 @@
+CRON_TZ=Asia/Shanghai
+
+# Morning full daily report
+5 9 * * * cd /opt/oa && . .venv/bin/activate && python -m src.pipeline.runner --scrape --force --push oc_xxx >> /var/log/oa/daily.log 2>&1
+
+# Afternoon hot-only refresh
+0 15 * * * cd /opt/oa && . .venv/bin/activate && python -m src.pipeline.runner --hot-only --push oc_xxx >> /var/log/oa/hot-only.log 2>&1
+
+# Optional nightly calibrator
+30 21 * * * cd /opt/oa && . .venv/bin/activate && python -m src.pipeline.runner --calibrate --calibrate-days 14 -v >> /var/log/oa/calibrate.log 2>&1

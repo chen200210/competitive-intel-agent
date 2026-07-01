@@ -1,13 +1,13 @@
-"""
-Pipeline runner — orchestrates the full daily report flow.
+﻿"""
+Pipeline runner orchestrates the full daily report flow.
 
 New flow (2026-06-23):
-  Phase 0A: Scrape (parallel) → 6 scrapers (diandian, taptap, steam_ports, news_feeds, pocketgamer_biz, bilibili)
-  Phase 0B: Loader → all CSV → DB
-  Phase 0C: Track Filter → tag all games
-  Phase 1:  Differ → StoryPicker (pure rules)
+  Phase 0A: Scrape (parallel) -> 6 scrapers (diandian, taptap, steam_ports, news_feeds, pocketgamer_biz, bilibili)
+  Phase 0B: Loader -> all CSV -> DB
+  Phase 0C: Track Filter -> tag all games
+  Phase 1:  Differ -> StoryPicker (pure rules)
   Phase 2:  Briefer (reads DB directly, generates Feishu card)
-  Phase 3:  Card Audit + Push → Feishu
+  Phase 3:  Card Audit + Push -> Feishu
 
 Usage:
     python -m src.pipeline.runner --date 2026-06-22
@@ -25,7 +25,35 @@ from pathlib import Path
 from typing import Any
 
 from src.storage.sqlite import get_db
+from src.config import is_hot_tracker_enabled, is_hot_tracker_required
 from src.types import PipelineRunStats
+
+
+def _hot_tracker_gate() -> tuple[bool, bool]:
+    """Return the hot-tracker feature flags."""
+    enabled = is_hot_tracker_enabled()
+    required = is_hot_tracker_required() if enabled else False
+    return enabled, required
+
+
+def _maybe_warn_hot_result(
+    hot_result: dict[str, Any],
+    warnings: list[str],
+    required: bool,
+) -> bool:
+    """Normalize hot-tracker warnings and return whether they are fatal."""
+    if hot_result.get("warnings"):
+        for w in hot_result["warnings"]:
+            warnings.append(f"Hot Topic: {w}")
+    if hot_result.get("error"):
+        msg = f"Hot tracker failed: {hot_result['error']}"
+        if required:
+            warnings.append(f"FATAL: {msg}")
+        else:
+            warnings.append(msg)
+        print(f"  [WARN] {warnings[-1]}")
+        return required
+    return False
 
 
 def _run_parallel(tasks: list[tuple[str, Any, tuple, dict]], max_workers: int = 8) -> list[dict]:
@@ -65,11 +93,11 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
     """
     db = get_db()
     steps: list[dict[str, Any]] = []
-    pipeline_warnings: list[str] = []  # non-fatal issues collected for health summary
+    pipeline_warnings: list[str] = []
     fatal_hot_error = False
     t_total = _time.monotonic()
 
-    def _step(name: str, fn, *args, **kwargs) -> Any:
+    def _step(name: str, fn, *args, warn_on_result_error: bool = True, **kwargs) -> Any:
         t0 = _time.monotonic()
         try:
             result = fn(*args, **kwargs)
@@ -78,13 +106,14 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
             msg = f"{name} failed: {e}"
             pipeline_warnings.append(msg)
             steps.append({"name": name, "ms": ms, "status": "error", "error": str(e)})
-            print(f"  [FAIL]  {name} ({ms}ms) — {e}")
+            print(f"  [FAIL]  {name} ({ms}ms) - {e}")
             return {"error": str(e)}
         ms = int((_time.monotonic() - t0) * 1000)
         status = "ok"
         if isinstance(result, dict) and result.get("error"):
             status = "error"
-            pipeline_warnings.append(f"{name}: {result.get('error', 'unknown')}")
+            if warn_on_result_error:
+                pipeline_warnings.append(f"{name}: {result.get('error', 'unknown')}")
         elif isinstance(result, dict) and result.get("skipped"):
             status = "skipped"
         steps.append({"name": name, "ms": ms, "status": status})
@@ -92,9 +121,6 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         print(f"  {tag:6s} {name} ({ms}ms)" if status != "skipped" else f"  {tag:6s} {name}")
         return result
 
-    # ═════════════════════════════════════════════════════════════
-    # Phase 1: Data Pipeline (zero AI cost)
-    # ═════════════════════════════════════════════════════════════
     print(f"\n{'='*50}")
     print(f"  Pipeline: {date}")
     print(f"{'='*50}")
@@ -108,14 +134,10 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         if force and changes:
             with db._connect() as conn:
                 conn.execute("DELETE FROM changes WHERE date = ?", (date,))
-                # Clear news dedup records for the date so re-runs
-                # (especially --brief-only) don't accumulate stale
-                # URL blocks from previous brief() → save_reported_news calls.
                 conn.execute(
                     "DELETE FROM reported_items WHERE item_type IN ('news','news_h')"
                     " AND reported_date = ?", (date,)
                 )
-                # Clean non-ranking data accidentally imported from scraper CSVs.
                 conn.execute("DELETE FROM rankings WHERE platform = ''")
                 conn.commit()
             print("  [FORCE] Deleted existing changes + non-ranking data")
@@ -133,55 +155,45 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         for s in stories[:3]:
             print(f"         [{s.get('story_type','?')}] {s.get('story_headline','?')[:60]}")
 
-    # 3. Track Filter — filter changes to track-relevant games only
+    # 3. Track filter: keep only track-relevant game changes
     from src.pipeline.track_filter import filter_track_changes
     track_changes = filter_track_changes(changes)
     if verbose:
-        print(f"         track filter: {len(changes)} changes → {len(track_changes)} track-relevant")
+        print(f"         track filter: {len(changes)} changes -> {len(track_changes)} track-relevant")
 
-    # ═════════════════════════════════════════════════════════════
-    # Phase 1.5: Hot Topic Search (DDG-first via VPN, fallback to domestic engines)
-    # ═════════════════════════════════════════════════════════════
-    from src.config import is_hot_tracker_enabled, is_hot_tracker_required
-    if is_hot_tracker_enabled():
-        from src.pipeline.hot_tracker import search_hot_topics
-        hot_result = _step("Hot Topic Search", search_hot_topics, date, force=force)
-        if hot_result.get("warnings"):
-            for w in hot_result["warnings"]:
-                pipeline_warnings.append(f"Hot Topic: {w}")
-        if hot_result.get("error"):
-            msg = f"Hot Topic Search failed: {hot_result.get('error')}"
-            if is_hot_tracker_required():
-                fatal_hot_error = True
-                pipeline_warnings.append(msg)
-            else:
-                pipeline_warnings.append(f"{msg} (ignored: hot_tracker.required=false)")
-        if verbose and hot_result.get("total_found"):
-            print(f"         hot topic search: found {hot_result['total_found']} articles across"
-                  f" {hot_result.get('keywords_searched', 0)} keywords")
-            if not hot_result.get("vpn_ok"):
-                print(f"         [WARN] DDG unreachable (VPN down), used fallback engines")
+    # Phase 1.5: Hot Topic Search
+    hot_enabled, hot_required = _hot_tracker_gate()
+    if not hot_enabled:
+        print("  [SKIP] Hot tracker disabled by config")
+        hot_result = {"skipped": True, "reason": "hot_tracker.disabled"}
+        steps.append({"name": "Hot Topic Search", "ms": 0, "status": "skipped"})
     else:
+        from src.pipeline.hot_tracker import search_hot_topics
         hot_result = _step(
             "Hot Topic Search",
-            lambda: {"skipped": True, "reason": "hot_tracker.disabled"},
+            search_hot_topics,
+            date,
+            force=force,
+            warn_on_result_error=False,
         )
+        fatal_hot_error = _maybe_warn_hot_result(hot_result, pipeline_warnings, hot_required)
+        if verbose and hot_result.get("total_found"):
+            print(
+                f"         hot topic search: found {hot_result['total_found']} articles across"
+                f" {hot_result.get('keywords_searched', 0)} keywords"
+            )
+            if not hot_result.get("vpn_ok"):
+                print("         [WARN] DDG unreachable (VPN down), used fallback engines")
 
-    # ═════════════════════════════════════════════════════════════
-    # Phase 2: Briefer (reads DB directly — all scraper + pipeline data)
-    # ═════════════════════════════════════════════════════════════
+    # Phase 2: Briefer (reads DB directly)
     print("\n── Phase 2: Briefer ──")
 
     from src.agents.briefer import brief_from_db
     brief_result = _step("Briefer", brief_from_db, date, verbose, warnings=pipeline_warnings)
     card = brief_result.get("card", {})
 
-    # Phase 4.5: Card Audit (zero token)
     if card:
         from src.pipeline.audit import audit_card, AuditContext
-
-        # Gather bilibili video URLs for URL validation (they're merged into
-        # market_news later in brief_from_db, so audit doesn't see them by default)
         bilibili_news: list[dict[str, Any]] = []
         try:
             bvideos = db.get_bilibili_videos_by_date(date)
@@ -210,25 +222,18 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         if audit_result.fixes_applied or audit_result.failures:
             _step("Card Audit", lambda: {"score": audit_result.score, "passed": audit_result.passed})
 
-    # ═════════════════════════════════════════════════════════════
-    # Summary + FATAL check
-    # ═════════════════════════════════════════════════════════════
     total_ms = int((_time.monotonic() - t_total) * 1000)
     total_s = total_ms / 1000
-    ai_steps = [s for s in steps if s["status"] != "skipped" and s["name"] not in
-                ("Differ", "Story Picker")]
+    ai_steps = [s for s in steps if s["status"] != "skipped" and s["name"] not in ("Differ", "Story Picker")]
     skipped = sum(1 for s in steps if s["status"] == "skipped")
     errors = sum(1 for s in steps if s["status"] == "error")
 
-    # ── FATAL classification ──
-    # Briefer produced no card → pipeline is useless, treat as fatal.
     fatal = (not card) or fatal_hot_error
     if not card:
-        pipeline_warnings.insert(0, "FATAL: Briefer produced no card — pipeline output is empty")
+        pipeline_warnings.insert(0, "FATAL: Briefer produced no card - pipeline output is empty")
     elif fatal_hot_error:
-        pipeline_warnings.insert(0, "FATAL: Hot Tracker failed and hot_tracker.required=true")
+        pipeline_warnings.insert(0, "FATAL: Hot tracker failed and hot_tracker.required=true")
 
-    # ── Save pipeline_runs record for monitoring ──
     try:
         phases_json = json.dumps(steps, ensure_ascii=False)
         error_summary = "; ".join(pipeline_warnings[:5]) if pipeline_warnings else ""
@@ -241,13 +246,12 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         )
     except Exception as e:
         print(f"  [WARN] insert_pipeline_run failed: {e}", file=sys.stderr)
-        # best-effort monitoring, never break the pipeline
 
     print(f"\n{'='*50}")
     print(f"  Pipeline complete: {total_s:.1f}s total")
     print(f"  Steps: {len(steps)} ({skipped} skipped, {errors} errors)")
     if fatal:
-        print(f"  [FATAL] Pipeline failed — no card produced")
+        print("  [FATAL] Pipeline failed - no card produced")
     if pipeline_warnings:
         print(f"  Warnings: {len(pipeline_warnings)}")
         for w in pipeline_warnings[:3]:
@@ -265,12 +269,6 @@ def run_pipeline(date: str, force: bool = False, verbose: bool = False) -> dict[
         "warnings": pipeline_warnings,
         "fatal": fatal,
     }
-
-
-# ═════════════════════════════════════════════════════════════
-# Phase 0: Scrape (CLI helper)
-# ═════════════════════════════════════════════════════════════
-
 def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     """Run all scrapers in parallel, then import all CSVs.
 
@@ -278,7 +276,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     Cleans up CSV files that don't match the target date after import.
 
     Before scraping, clears today's news records so each run starts
-    with a clean slate — no stale dedup data blocking new content.
+    with a clean slate and no stale dedup data blocking new content.
     """
     import subprocess
 
@@ -286,9 +284,9 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     scrapers_dir = project_root / "tools" / "scrapers"
     skip_set = set(skip or [])
 
-    # ── Clean today's news data so scrapers + pipeline start fresh ──
+    # Clean today's news data so scrapers + pipeline start fresh.
     db = get_db()
-    # Preserve user feedback counters across the DELETE→re-INSERT cycle.
+    # Preserve user feedback counters across the delete/re-insert cycle.
     # Scrapers re-insert via INSERT OR REPLACE which resets useful_count
     # and useless_count to 0 (they are not in the INSERT column list).
     _counter_map: dict[str, tuple[int, int]] = {}
@@ -317,7 +315,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     except Exception as e:
         print(f"  [WARN] News cleanup failed: {e}")
 
-    # ── Pre-check: skip scrapers with data already in DB ──
+    # Pre-check: skip scrapers with data already in DB.
     scraper_db_table = {
         "diandian_batch.py":      "rankings",
         "taptap_new_games.py":    "taptap_new_games",
@@ -328,7 +326,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     }
 
     # Per-scraper WHERE clause for shared-table pre-checks.
-    # Defaults to "date = ?" — overridden when two scrapers write the same table.
+    # Defaults to "date = ?"; overridden when two scrapers write the same table.
     scraper_where: dict[str, str] = {
         "news_feeds.py":        "date = ? AND source != 'pocketgamer.biz'",
         "pocketgamer_biz.py":   "date = ? AND source = 'pocketgamer.biz'",
@@ -348,7 +346,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     for script, extra_args in scraper_scripts:
         name = script.replace(".py", "")
         if name in skip_set or script in skip_set:
-            print(f"  [SKIP] {script} — user-requested skip")
+            print(f"  [SKIP] {script} - user-requested skip")
             continue
         table = scraper_db_table.get(script)
         if table:
@@ -356,12 +354,12 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
             sql = f"SELECT COUNT(*) as cnt FROM {table} WHERE {where_clause}"
             row = db._connect().execute(sql, (date,)).fetchone()
             if row and row["cnt"] > 0:
-                print(f"  [SKIP] {script} — {row['cnt']} rows for {date} already in {table}")
+                print(f"  [SKIP] {script} - {row['cnt']} rows for {date} already in {table}")
                 continue
         active_scripts.append((script, extra_args))
 
     if not active_scripts:
-        print(f"  All scrapers skipped — data already exists for {date}")
+        print(f"  All scrapers skipped - data already exists for {date}")
         return
 
     print("\n── Phase 0A: Scrape (parallel) ──")
@@ -369,7 +367,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
     for script, extra_args in active_scripts:
         script_path = scrapers_dir / script
         if not script_path.exists():
-            print(f"  [SKIP] {script} — not found")
+            print(f"  [SKIP] {script} - not found")
             continue
         cmd = [sys.executable, str(script_path)] + extra_args
         env = {**__import__('os').environ, "PYTHONIOENCODING": "utf-8"}
@@ -394,7 +392,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
             if status == "error":
                 err_msg = r.get('error', '')
                 # Print full error (at least first 500 chars) so scraper failures
-                # like B站 timeouts aren't silently lost behind truncated output.
+                # like Bilibili timeouts are not silently lost behind truncation.
                 print(f"         {err_msg[:500]}")
                 if len(err_msg) > 500:
                     print(f"         ... ({len(err_msg)} total chars, truncated)")
@@ -408,7 +406,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
                     if stderr_out.strip():
                         print(f"         {stderr_out}")
 
-    # ── Restore feedback counters after scraper re-insert ──
+    # Restore feedback counters after scraper re-insert.
     if _counter_map:
         db = get_db()
         try:
@@ -428,7 +426,7 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
         except Exception as e:
             print(f"  [WARN] Counter restore failed: {e}")
 
-    # ── Phase 0.5: Hot Keywords ──
+    # Phase 0.5: Hot Keywords
     print("\n── Phase 0.5: Hot Keywords ──")
     try:
         from src.pipeline.hot_tracker import collect_hot_keywords
@@ -437,11 +435,11 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
             print(f"  [OK] Collected {kw_result['count']} hot keywords"
                   f" from {kw_result.get('sources', [])}")
         else:
-            print(f"  [WARN] No hot keywords collected — hot topic section will be skipped")
+            print("  [WARN] No hot keywords collected - hot topic section will be skipped")
     except Exception as e:
         print(f"  [WARN] Hot keyword collection failed: {e}")
 
-    # ── Phase 0B: Loader ──
+    # Phase 0B: Loader
     print("\n── Phase 0B: Loader ──")
     from src.pipeline.loader import import_csv, extract_date_from_filename
     from src.config import settings
@@ -455,12 +453,12 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
                 n = import_csv(str(f), date=file_date)
                 imported += n.get("imported", 0)
             else:
-                print(f"    [SKIP] {f.name} — date {file_date} already in DB")
+                print(f"    [SKIP] {f.name} - date {file_date} already in DB")
         except Exception as e:
             print(f"    [WARN] {f.name}: {e}")
     print(f"  Loader: {imported} new records imported")
 
-    # ── Phase 0C: Cleanup old CSVs ──
+    # Phase 0C: Cleanup old CSVs
     # Delete CSV files that don't match the target date.
     # Data is already in the DB, so these are just clutter.
     deleted = 0
@@ -471,14 +469,14 @@ def _run_phase0_scrape(date: str, skip: list[str] | None = None) -> None:
                 f.unlink()
                 deleted += 1
         except ValueError:
-            # Files without a recognizable date — keep them (might be test output)
+            # Files without a recognizable date: keep them (might be test output).
             pass
     if deleted:
         print(f"  Cleanup: removed {deleted} old CSV(s) from {raw_dir}")
 
 
 def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
-    """Afternoon hot-topic refresh — re-collect keywords, re-search, push standalone card.
+    """Afternoon hot-topic refresh: re-collect keywords, re-search, push standalone card.
 
     Unlike the full pipeline, this only touches hot-topic phases and does not
     re-scrape or re-run Differ / StoryPicker / Briefer.
@@ -487,10 +485,10 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
         {"date": date, "keywords": [...], "hot_items": [...], "pushed": bool}
     """
     from datetime import datetime as _dt
-    from src.config import is_hot_tracker_enabled
     from src.pipeline.hot_tracker import collect_hot_keywords, search_hot_topics
     from src.agents.render import build_hot_topics_md, build_hot_topic_elements
-    hot_enabled = is_hot_tracker_enabled()
+
+    hot_enabled, _hot_required = _hot_tracker_gate()
     if not hot_enabled:
         print("  [SKIP] Hot tracker disabled by config")
         return {
@@ -503,7 +501,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
         }
 
     print(f"\n{'='*50}")
-    print(f"  🔥 Hot-Only Update: {date}")
+    print(f"  Hot-Only Update: {date}")
     print(f"{'='*50}")
 
     db = get_db()
@@ -515,21 +513,30 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
     except Exception as e:
         print(f"  [WARN] Failed to clear today's hot topics: {e}")
 
-    # ── Phase 0.5: Re-collect hot keywords (afternoon trends differ from morning) ──
+    # Re-collect hot keywords (afternoon trends differ from morning).
     print("\n── Hot Keywords (re-collect) ──")
     kw_result = collect_hot_keywords(date)
     keywords = kw_result.get("keywords", [])
     if not keywords:
-        print("  [WARN] No hot keywords collected — aborting hot-only update")
+        print("  [WARN] No hot keywords collected - aborting hot-only update")
         return {"date": date, "keywords": [], "hot_items": [], "pushed": False}
     print(f"  [OK] {kw_result['count']} keywords from {kw_result.get('sources', [])}")
     if keywords:
         kw_tags = " · ".join(k["keyword"] for k in keywords[:5])
         print(f"       {kw_tags}")
 
-    # ── Phase 1.5: Re-search (force to bypass morning cache) ──
+    # Re-search with force to bypass morning cache.
     print("\n── Hot Topic Search (force re-search) ──")
     hot_result = search_hot_topics(date, force=True)
+    if hot_result.get("error"):
+        print(f"  [FAIL] Hot tracker failed: {hot_result['error']}")
+        return {
+            "date": date,
+            "keywords": keywords,
+            "hot_items": [],
+            "pushed": False,
+            "error": hot_result["error"],
+        }
     total_found = hot_result.get("total_found", 0)
     print(f"  [OK] Found {total_found} articles across"
           f" {hot_result.get('keywords_searched', 0)} keywords")
@@ -537,7 +544,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
         for w in hot_result["warnings"]:
             print(f"  [WARN] {w}")
 
-    # ── Read AI-selected items from DB ──
+    # Read AI-selected items from DB.
     hot_items = db.get_hot_topic_news_by_date(date, selected=True, limit=7)
     hot_keyword_names = [k["keyword"] for k in keywords]
 
@@ -546,7 +553,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
         hot_items = db.get_hot_topic_news_by_date(date, selected=False, limit=7)
         print(f"  [INFO] No AI-selected items, using search-order fallback ({len(hot_items)} items)")
 
-    # ── Print selected items to terminal ──
+    # Print selected items to terminal.
     if hot_items:
         print(f"\n── Selected Hot Topics ({len(hot_items)} items) ──")
         for i, item in enumerate(hot_items, 1):
@@ -555,12 +562,12 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
             score = item.get("value_score", "?")
             summary = item.get("ai_summary", "") or item.get("snippet", "") or ""
             url = item.get("url", "") or "(no url)"
-            summary_short = summary[:100] + "…" if len(summary) > 100 else summary
+            summary_short = summary[:100] + "..." if len(summary) > 100 else summary
             print(f"  {i}. [{score}] {headline}")
-            print(f"     {source} — {summary_short}")
+            print(f"     {source} - {summary_short}")
             print(f"     URL: {url}")
 
-    # ── Build standalone hot-topic card ──
+    # Build standalone hot-topic card.
     now = _dt.now().strftime("%H:%M")
     hot_md = build_hot_topics_md(hot_items, hot_keyword_names) if hot_items else ""
     hot_elements = build_hot_topic_elements(hot_md, hot_items, date=date) if hot_items else []
@@ -568,7 +575,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
-            "content": f"🕐 更新于 {now} · 关键词重新采集 · 搜索强制刷新",
+            "content": f"更新于 {now} · 关键词重采集 · 搜索强制刷新",
         },
     ]
     elements.extend(hot_elements)
@@ -577,7 +584,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": f"🔥 午间热点速报 | {date}"},
+                "title": {"tag": "plain_text", "content": f"热点速报 | {date}"},
                 "template": "red",
             },
             "elements": elements,
@@ -586,7 +593,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
 
     pushed = False
     if push_chat_id and (hot_items or hot_md):
-        print(f"\n── Push ──")
+        print("\n── Push ──")
         from src.feishu.pusher import push_card
         push_result = push_card(card_data, push_chat_id)
         if push_result.get("success"):
@@ -608,11 +615,7 @@ def run_hot_only(date: str, push_chat_id: str | None = None) -> dict[str, Any]:
 
 
 def _print_deep_research_report(result: dict[str, Any]) -> None:
-    """Pretty-print a Deep Research report to the terminal.
-
-    Shows the 500-word markdown report prominently, followed by
-    key findings, confidence, and citations.
-    """
+    """Pretty-print a Deep Research report to the terminal."""
     if not result.get("success"):
         print(f"\n[FAIL] Deep Research failed: {result.get('error', 'unknown')}")
         return
@@ -624,49 +627,43 @@ def _print_deep_research_report(result: dict[str, Any]) -> None:
     cached = result.get("cached", False)
     topic = result.get("topic", "")
 
-    confidence_label = {"high": "🟢 高", "medium": "🟡 中", "low": "🔴 低"}.get(
-        confidence, f"🟡 {confidence}"
-    )
+    confidence_label = {"high": "高", "medium": "中", "low": "低"}.get(confidence, "中")
 
     print()
     print("=" * 64)
-    print(f"  🔬 深度研究报告")
+    print("  深度研究报告")
     print(f"  话题: {topic}")
-    print(f"  置信度: {confidence_label}" + ("  (缓存)" if cached else ""))
+    print(f"  置信度: {confidence_label}" + (" (缓存)" if cached else ""))
     print("=" * 64)
     print()
     print(report_md)
     print()
 
     if key_findings:
-        print("─" * 48)
-        print("  💡 核心发现")
+        print("=" * 48)
+        print("  核心发现")
         for i, f in enumerate(key_findings, 1):
             print(f"    {i}. {f}")
         print()
 
     if citations:
-        print("─" * 48)
-        print(f"  📎 引用来源 ({len(citations)} 条)")
+        print("=" * 48)
+        print(f"  引用来源 ({len(citations)} 条)")
         for i, c in enumerate(citations[:10], 1):
             url = c.get("url", "")
             title = c.get("title", "") or url
-            verified = "✅" if c.get("verified") else "⏳"
+            verified = "✓" if c.get("verified") else "?"
             print(f"    {i}. {verified} {title}")
             if url:
                 print(f"       {url}")
         print()
 
-    print("─" * 48)
+    print("=" * 48)
     print(f"  report_id: {result.get('report_id', 'N/A')}")
     if result.get("push_success"):
-        print(f"  已推送到飞书 ✅")
+        print("  已推送到飞书 ✓")
     print("=" * 64)
 
-
-# ═════════════════════════════════════════════════════════════
-# CLI
-# ═════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import argparse
@@ -698,14 +695,14 @@ if __name__ == "__main__":
         from datetime import date as dt_date
         date_arg = dt_date.today().strftime("%Y-%m-%d")
 
-    # ── Hot-Only (standalone afternoon refresh) ──
+    # Hot-Only (standalone afternoon refresh)
     if args.hot_only:
         result = run_hot_only(date_arg, push_chat_id=args.push)
         if args.brief_only:
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         sys.exit(0)
 
-    # ── Deep Research (standalone — runs instead of pipeline) ──
+    # Deep Research (standalone; runs instead of pipeline)
     if args.deep_research:
         from src.agents.deep_researcher import run_deep_research
         dr_result = run_deep_research(
@@ -720,7 +717,7 @@ if __name__ == "__main__":
             _print_deep_research_report(dr_result)
         sys.exit(0 if dr_result.get("success") else 1)
 
-    # ── Calibrator (standalone — runs instead of pipeline) ──
+    # Calibrator (standalone; runs instead of pipeline)
     if args.calibrate:
         if args.scrape or args.push or args.skip:
             print(
@@ -737,21 +734,21 @@ if __name__ == "__main__":
         print(json.dumps(calib_result, ensure_ascii=False, indent=2, default=str))
         sys.exit(0)
 
-    # ── Phase 0: Scrape + Load (optional) ──
+    # Phase 0: Scrape + Load (optional)
     if args.scrape:
         skip_list = [s.strip() for s in args.skip.split(",") if s.strip()]
         _run_phase0_scrape(date_arg, skip=skip_list)
 
     result = run_pipeline(date_arg, force=args.force, verbose=args.verbose)
 
-    # ── Fatal check ──
+    # Fatal check
     if result.get("fatal"):
-        print("\n[FATAL] Pipeline failed — see warnings above for details.", file=sys.stderr)
+        print("\n[FATAL] Pipeline failed - see warnings above for details.", file=sys.stderr)
         sys.exit(1)
 
-    # ── Phase 5: Push (optional) ──
+    # Phase 5: Push (optional)
     if args.push:
-        print(f"\n── Phase 5: Push ──")
+        print("\n── Phase 5: Push ──")
         from src.feishu.pusher import push_daily_card, push_card
 
         db = get_db()
@@ -772,3 +769,4 @@ if __name__ == "__main__":
         print(json.dumps(result["card"], ensure_ascii=False, indent=2))
     else:
         print(json.dumps(result["card"], ensure_ascii=False, indent=2, default=str))
+

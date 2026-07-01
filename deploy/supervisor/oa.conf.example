@@ -1,0 +1,21 @@
+[program:oa-feishu-bot]
+directory=/opt/oa
+command=/opt/oa/.venv/bin/python -m src.feishu.bot
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/var/log/oa/feishu-bot.log
+stderr_logfile=/var/log/oa/feishu-bot.err.log
+environment=PYTHONUNBUFFERED="1"
+
+[program:oa-health-api]
+directory=/opt/oa
+command=/opt/oa/.venv/bin/uvicorn src.main:app --host 127.0.0.1 --port 8000
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/var/log/oa/health-api.log
+stderr_logfile=/var/log/oa/health-api.err.log
+environment=PYTHONUNBUFFERED="1"

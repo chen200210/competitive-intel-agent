@@ -1,0 +1,16 @@
+.git
+.codex
+.claude
+.env
+venv
+.venv
+__pycache__
+*.pyc
+data/intel.db
+data/intel.db-wal
+data/intel.db-shm
+data/raw
+data/chroma
+data/.bilibili_chrome_profile
+data/.diandian_chrome_profile
+backup_2026-06-30_components

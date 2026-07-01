@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    command: ["python", "-m", "src.feishu.bot"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+
+  health-api:
+    build: .
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+
+  runner:
+    build: .
+    profiles: ["manual"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "src.pipeline.runner", "--date", "2026-06-30"]

@@ -46,6 +46,7 @@ from src.agents.render import (
     build_hot_topics_md, build_hot_topic_elements, _parse_downloads,
 )
 from src.agents.scorer import ai_summarize_and_judge
+from src.config import is_hot_tracker_enabled
 from src.pipeline.differ import classify_day
 from src.pipeline.track_filter import filter_track_changes, classify_game
 from src.tools.taptap_resolver import fuzzy_match_game_name
@@ -379,7 +380,6 @@ def brief_from_db(date: str, verbose: bool = False, warnings: list[str] | None =
         sector_changes = extras + sector_changes
 
     # ── Hot topics data ──
-    from src.config import is_hot_tracker_enabled
     if is_hot_tracker_enabled():
         hot_items = db.get_hot_topic_news_by_date(date, selected=True, limit=7)
         hot_keywords_rows = db.get_hot_keywords_by_date(date)

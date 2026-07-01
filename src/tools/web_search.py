@@ -30,55 +30,6 @@ UA = (
 )
 
 
-def _search_bocha(query: str, max_results: int = 5, *, news: bool = False) -> str:
-    """Search via Bocha API and normalize to the repo's search JSON shape."""
-    from src.config import settings
-
-    if not settings.bocha_api_key or not settings.bocha_base_url:
-        raise RuntimeError("BOCHA_API_KEY/BOCHA_BASE_URL not set")
-
-    endpoint = settings.bocha_base_url.rstrip("/")
-    if news and not endpoint.endswith("/news"):
-        endpoint = f"{endpoint}/news"
-
-    payload = {
-        "query": query,
-        "count": max_results,
-        "lang": "zh",
-        "freshness": "day" if news else "week",
-    }
-    headers = {
-        "Authorization": f"Bearer {settings.bocha_api_key}",
-        "Content-Type": "application/json",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "User-Agent": UA,
-    }
-
-    resp = httpx.post(endpoint, json=payload, headers=headers, timeout=20.0)
-    resp.raise_for_status()
-    data = resp.json()
-
-    raw_items = data.get("results") or data.get("data") or data.get("items") or []
-    results: list[dict[str, Any]] = []
-    for item in raw_items[:max_results]:
-        title = item.get("title") or item.get("name") or ""
-        url = item.get("url") or item.get("link") or ""
-        snippet = item.get("snippet") or item.get("summary") or item.get("content") or ""
-        if not title or not url:
-            continue
-        content = item.get("content", "")
-        results.append({
-            "title": title,
-            "url": url,
-            "snippet": snippet[:300],
-            "content": content[:600] if isinstance(content, str) else "",
-            "time_str": item.get("time") or item.get("published_at") or item.get("date") or "",
-        })
-
-    engine = "bocha-news" if news else "bocha-web"
-    return json.dumps({"query": query, "results": results, "engine": engine}, ensure_ascii=False)
-
-
 # ── Tavily (primary) ───────────────────────────────────────────
 
 def _search_tavily(query: str, max_results: int = 5) -> str:

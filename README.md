@@ -1,125 +1,110 @@
-# 竞品情报智能体 — 设计概要
+# 竞品情报智能体
 
-## 一句话说清楚
+面向游戏行业的日报系统，负责自动汇总榜单变化、市场新闻、Steam 移植、TapTap 新游和热点话题，并生成可直接推送到飞书的日报卡片。
 
-每天导入点点数据榜单 CSV → 系统自动对比昨天排名 → 从 100 款游戏中挑出今天最值得讲的 3~5 个故事 → AI 调研分析 → 飞书推送**图文并茂、无需外部搜索**的日报。
+部署、托管、验收请优先看:
 
-回答三个核心问题：**这个方向值不值得做？谁在做、做到哪了？如果做，竞争风险在哪里？**
+- [README_DEPLOY.md](/E:/DOSH/OA/README_DEPLOY.md)
+- [docs/OPS_ONE_PAGE.md](/E:/DOSH/OA/docs/OPS_ONE_PAGE.md)
 
-**业务聚焦**：塔防品类 + 微恐/冰河/火山爆发题材 + 已被市场验证的玩法。
+## 项目在做什么
 
-**当前状态**：基础管道 + 6 Agent 已跑通，全链路 ~3min。新报表架构（NEW_REPORT_ARCHITECTURE.md）功能持续迭代中。
+系统每天会处理这些信息源:
 
----
+- 排行榜 CSV 导入与每日排名对比
+- TapTap 新游日历
+- Steam 移植检测
+- 游戏行业资讯头条
+- B 站创作者动态
+- 热点关键词与热点追踪
 
-## 数据流
+最终输出 4 个主要板块:
 
+- 新游关注
+- 市场变动
+- 排名变动
+- 热点追踪
+
+其中前 3 个板块是主链路，热点追踪可按配置冷插拔。
+
+## 核心链路
+
+```text
+Scrapers -> Loader -> Differ -> Story Picker -> Briefer -> Card Audit -> Feishu
+                                  |              |
+                                  |              +-> Market News Pipeline
+                                  +-> Track Filter
+                                  +-> Hot Tracker (optional)
 ```
-CSV 导入 → Differ(算变动) → Story Picker(筛故事) → 6 个 AI Agent → 飞书日报
-  │              │                  │                    │              │
- 纯脚本       纯脚本              纯规则              AI 干活         脚本
+
+关键目录:
+
+- `src/agents/`
+  作用: briefer、scorer、render、deep_researcher、calibrator 等 Agent 模块
+- `src/pipeline/`
+  作用: differ、story_picker、track_filter、runner、audit 等规则流水线
+- `src/feishu/`
+  作用: 卡片推送、交互按钮、bot 回调
+- `src/storage/`
+  作用: SQLite schema 与 CRUD
+- `tools/scrapers/`
+  作用: 点点、TapTap、Steam、资讯、B 站等抓取器
+- `data/`
+  作用: SQLite 主库、配置 YAML、raw 中间数据、浏览器 profile
+
+## 常用命令
+
+全量日报:
+
+```bash
+python -m src.pipeline.runner --scrape --force
 ```
 
-| 层 | 模块 | 做什么 | 成本 |
-|---|------|--------|------|
-| 数据管道 | Loader / Differ | 解析 CSV、对比排名、计算 attention_score | 纯代码，免费 |
-| 故事筛选 | Story Picker | 从 20~40 条变动中匹配 5 类故事，输出 ≤5 条 | 纯规则，免费 |
-| AI 分析 | 6 Agent 协作 | 调研 + 核验 + 商业分析 + 玩法分析 + 简报 | Claude API 付费 |
-| 分发 | Pusher | 飞书推送 + 交互问答 | 飞书 API 免费 |
+推送飞书:
 
-**TD 品类加成**：塔防和目标题材的变动自动获得 attention_score 加分，确保公司关注的赛道不被漏掉。
+```bash
+python -m src.pipeline.runner --scrape --force --push oc_xxx
+```
 
----
+下午热点速报:
 
-## Agent 全家福
+```bash
+python -m src.pipeline.runner --hot-only --push oc_xxx
+```
 
-| # | Agent | 什么时候跑 | 做什么 |
-|---|-------|----------|--------|
-| A0 | **Overview Scanner** | 每天必跑 | 搜索今日行业新闻，补充背景信息 |
-| A1 | **Researcher** | 按需（仅精选故事） | 五维搜索（事件/玩法/玩家/设计/**在研**），抓取截图 |
-| B | **Verifier** | 按需 | 信息可信度核验，过滤不可靠来源 |
-| C1 | **Analyst（商业）** | 每天 | 因果推理 + 7 天趋势判断 + 影响评估 |
-| C2 | **Design Analyst（玩法+决策）** | 有深挖价值时 | 玩法拆解 + **值不值得做** + **竞争风险评估** |
-| E | **Briefer** | 每天 | 融合全部分析 → 图文并茂的飞书卡片 |
+启动飞书 bot:
 
----
+```bash
+python -m src.feishu.bot
+```
 
-## Story Picker：从 100 款中挑 5 个故事
+启动健康检查 API:
 
-纯规则引擎，零 AI 成本。自动识别 5 类故事，**TD 品类自动加权**：
+```bash
+uvicorn src.main:app --host 127.0.0.1 --port 8000
+```
 
-| 故事类型 | 检测规则 | 例子 |
-|---------|---------|------|
-| 🔺 大幅跃升 | 排名飙升 ≥15 位 | 某 TD 新游一天跳 30 位 |
-| 🆕 黑马突围 | 新上榜直接进入前 50 | 微恐题材独立游戏首次冲榜 |
-| 📉 断崖下跌 | 暴跌 ≥20 位，或前 30 掉榜 | 头部 TD 产品突然掉出前 30 |
-| 📈 持续爬升 | 连续 5+ 天稳步上升 | 冰河题材游戏连续一周爬升 |
-| 🎯 品类异动 | 同一赛道 ≥3 款同向变动 | 塔防品类集体上升 |
+## 配置与数据
 
----
+环境变量模板:
 
-## 决策者最关心的部分：Design Analyst
+- [.env.example](/E:/DOSH/OA/.env.example)
 
-Design Analyst 回答 **3 个核心问题，覆盖 10 个分析维度**：
+关键持久化资产:
 
-### 1. 为什么好玩、设计上可学什么？
-核心玩法亮点 / 玩家动机设计 / 付费设计 / 留存机制 / 可借鉴点 / 竞争差异
+- `data/intel.db`
+- `data/competitor_list.yaml`
+- `data/bilibili_creators.yaml`
+- `data/.bilibili_chrome_profile/`
+- `data/.diandian_chrome_profile/`
 
-### 2. 🆕 这个方向值不值得做？
-赛道可行性判断 / 市场天花板 / 用户需求是否被充分满足 / 市场窗口期预估
+热点模块开关说明:
 
-### 3. 🆕 竞争风险在哪里？
-在研公司追踪（含**公司名称/产品/进度/覆盖率/威胁等级**）+ 题材热度趋势 + 市场验证信号
+- [docs/HOT_TRACKER_COLD_PLUG.md](/E:/DOSH/OA/docs/HOT_TRACKER_COLD_PLUG.md)
 
----
+## 交接阅读顺序
 
-## 简报：看图即知，不需外部搜索
-
-设计原则：**读者看完卡片不需要再做任何搜索**。
-
-每份日报包含：
-- 📊 今日概况（一句话摘要）
-- 🔴 重点关注（排名变动 + 因果 + 游戏截图 + 来源链接）
-- 🎮 设计洞察（玩法拆解 + 可借鉴点 + 截图佐证）
-- ⚠️ 竞争风险（在研公司表格：名称/产品/进度/覆盖率/威胁）
-- 📋 其他变动（一行带过）
-
----
-
-## PDCA 框架
-
-| 环节 | 系统实现 |
-|------|---------|
-| **Plan** | 竞品列表配置 + TD/题材关注策略 |
-| **Do** | 数据采集 + 五维调研 + 商业分析 + 玩法分析 + 图文简报 |
-| **Check** | 信息可靠性核验 + 渠道拓展 + Prompt/参数自优化 |
-| **Action** | 飞书定时推送 + @机器人交互问答 |
-
----
-
-## 技术栈
-
-FastAPI + SQLite + Chroma + Claude API + 飞书 SDK + Docker
-
-所有数据本地化，零部署成本。个人电脑一键启动，支持平滑迁移至云服务器/K8s。
-
----
-
-## 文件导航
-
-| 文件 | 内容 | 适合谁 |
-|------|------|--------|
-| `README.md`（本文件） | 3 分钟概览 | 所有人 |
-| `DESIGN.md` | 完整设计文档（~1700 行） | 开发时逐节参考 |
-| `AI_CODING_GUIDE.md` | AI 编码实操指南 | 开始写代码前必读 |
-
-`DESIGN.md` 包含：
-- 完整架构图与数据流
-- 真实数据格式与 Loader/Differ/Story Picker 伪代码
-- attention_score 算法（含 breakout + TD 加成）
-- 6 个 Agent 的完整输入/输出 JSON Schema
-- 飞书消息卡片格式（含图片和竞争风险表）
-- 数据库表设计（含 in_development_tracking）
-- REST API 设计
-- 7 周实现计划（10 个 Session）
-- 部署方案（个人电脑 → 云服务器 → K8s）
+1. [README_DEPLOY.md](/E:/DOSH/OA/README_DEPLOY.md)
+2. [docs/OPS_ONE_PAGE.md](/E:/DOSH/OA/docs/OPS_ONE_PAGE.md)
+3. [docs/HANDOFF_INDEX.md](/E:/DOSH/OA/docs/HANDOFF_INDEX.md)
+4. [docs/NEW_REPORT_ARCHITECTURE.md](/E:/DOSH/OA/docs/NEW_REPORT_ARCHITECTURE.md)
